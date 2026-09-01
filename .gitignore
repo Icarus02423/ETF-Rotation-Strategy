@@ -1,0 +1,9 @@
+# GitHub版本只保存脚本、全部输出和README；.env始终仅留在本机。
+*
+!.gitignore
+!.gitattributes
+!README.md
+!scripts/
+!scripts/**
+!outputs/
+!outputs/**

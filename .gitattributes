@@ -1,0 +1,7 @@
+# 仅大型ETF数据文件使用Git LFS；其余outputs文件仍逐文件保存在普通Git中。
+outputs/etf_data/etf_data.csv filter=lfs diff=lfs merge=lfs -text
+outputs/etf_data/benchmark.csv filter=lfs diff=lfs merge=lfs -text
+outputs/etf_data/custodian.csv filter=lfs diff=lfs merge=lfs -text
+outputs/etf_data/manager.csv filter=lfs diff=lfs merge=lfs -text
+outputs/etf_data/name.csv filter=lfs diff=lfs merge=lfs -text
+outputs/etf_data/tracking_index.csv filter=lfs diff=lfs merge=lfs -text
