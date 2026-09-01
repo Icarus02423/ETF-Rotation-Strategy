@@ -1,17 +1,16 @@
-"""分别检验三种ETF趋势得分的截面Rank IC。
+"""分别检验两种ETF趋势得分的截面Rank IC。
 
 口径：
-1. 每个信号日分别按三种趋势得分降序选择前10%的有效指数，数量向上取整；随后
+1. 每个信号日分别按两种趋势得分降序选择前10%的有效指数，数量向上取整；随后
    仅保留窗口收益率大于0的指数，不向后补选。
 2. 按现有回测口径，在信号日为每个指数选择成交量最大的ETF；成交量相同则依次
    比较成交额、规模和ETF代码。
 3. 下一ETF交易日按VWAP买入，持有1至20个交易日后按VWAP卖出。
 4. 每个信号日、每个持有期计算一次Spearman秩相关系数（Rank IC）。
 
-脚本按得分公式分别生成三个文件；每个文件都包含“汇总”和“逐日RankIC”：
+脚本按得分公式分别生成两个文件；每个文件都包含“汇总”和“逐日RankIC”：
 outputs/etf_strategy_test/trend_rank_ic/01_收益率乘R平方.xlsx
 outputs/etf_strategy_test/trend_rank_ic/02_收益率除以波动率.xlsx
-outputs/etf_strategy_test/trend_rank_ic/03_收益率除以波动率乘R平方.xlsx
 """
 
 from __future__ import annotations
@@ -40,12 +39,10 @@ MIN_WINDOW_RETURN = 0.0
 SCORE_COLUMNS = {
     "收益率×R平方": "趋势质量因子",
     "收益率÷波动率": "风险调整趋势得分",
-    "收益率÷波动率×R平方": "风险调整R平方趋势得分",
 }
 OUTPUT_FILES = {
     "收益率×R平方": OUTPUT_DIR / "01_收益率乘R平方.xlsx",
     "收益率÷波动率": OUTPUT_DIR / "02_收益率除以波动率.xlsx",
-    "收益率÷波动率×R平方": OUTPUT_DIR / "03_收益率除以波动率乘R平方.xlsx",
 }
 FACTOR_COLUMNS = {"日期", "对标指数代码", "窗口收益率"} | set(SCORE_COLUMNS.values())
 ETF_COLUMNS = {
@@ -485,7 +482,7 @@ def main() -> None:
     required_prices = collect_required_prices(signals, mapping, schedule)
     print("读取计算未来收益所需的VWAP……")
     prices = load_required_vwap(required_prices)
-    print("比较三种得分前10%指数在1至20个交易日的逐日Rank IC……")
+    print("比较两种得分前10%指数在1至20个交易日的逐日Rank IC……")
     daily = calculate_daily_rank_ic(signals, mapping, schedule, prices)
     write_output(daily)
     print(f"完成：{OUTPUT_DIR}")

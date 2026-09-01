@@ -4,7 +4,7 @@
 ETF趋势轮动策略回测。
 
 策略：
-1. 分别按三种趋势得分降序选择前10%的代表指数；
+1. 分别按两种趋势得分降序选择前10%的代表指数；
 2. 排名后仅保留当前趋势窗口收益率大于0的指数，不向后补选；
 3. 对每个保留指数，在当日所有跟踪该指数且成交量大于0的ETF中，
    选择成交量最大者；成交量相同时依次比较成交额、规模和ETF代码；
@@ -50,8 +50,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # ============================= 回测参数 =============================
 CLUSTER_CORRELATION_THRESHOLD = 0.8
 TREND_WINDOW = 40
-# 默认一次运行三种得分。若以后只想跑其中一种，可只保留对应英文键。
-SCORE_METHODS_TO_RUN = ("return_r2", "return_vol", "return_vol_r2")
+# 默认一次运行两种得分。若以后只想跑其中一种，可只保留对应英文键。
+SCORE_METHODS_TO_RUN = ("return_r2", "return_vol")
 TOP_PERCENT = 0.010
 # "rebalance"：全组合每x个交易日调仓；"staggered"：x个账户逐日错峰持有x日。
 REBALANCE_MODE = "staggered"
@@ -65,8 +65,7 @@ ACCOUNT_VARIANT_DIR = (
     f"rebalance_{ACCOUNT_REBALANCE_INTERVAL}d"
     if REBALANCE_MODE == "rebalance"
     else (
-        f"staggered_{ACCOUNT_REBALANCE_INTERVAL}_accounts_"
-        f"hold_{ACCOUNT_REBALANCE_INTERVAL}d"
+        f"staggered_{ACCOUNT_REBALANCE_INTERVAL}d"
     )
 )
 TRANSACTION_COST_RATE = 0.001
@@ -82,12 +81,10 @@ ALLOWED_TREND_WINDOWS = (20, 40, 60)
 SCORE_COLUMNS = {
     "return_r2": "趋势质量因子",
     "return_vol": "风险调整趋势得分",
-    "return_vol_r2": "风险调整R平方趋势得分",
 }
 SCORE_LABELS = {
     "return_r2": "收益率×R平方",
     "return_vol": "收益率÷波动率",
-    "return_vol_r2": "收益率÷波动率×R平方",
 }
 FACTOR_DIR = (
     PROJECT_ROOT
@@ -2211,7 +2208,7 @@ def main() -> None:
         f"趋势窗口 {TREND_WINDOW}，选择调仓信号日得分前 {TOP_PERCENT:.0%}；"
         f"排名后过滤窗口收益率不大于 {MIN_WINDOW_RETURN:g} 的指数，"
         f"{rebalance_description}；"
-        "本次依次回测三种得分公式。",
+        "本次依次回测两种得分公式。",
         flush=True,
     )
     for score_method in SCORE_METHODS_TO_RUN:

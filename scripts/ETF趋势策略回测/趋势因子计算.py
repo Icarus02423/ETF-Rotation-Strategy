@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-对月底动态指数池中的指数逐日计算三种趋势得分。
+对月底动态指数池中的指数逐日计算两种趋势得分。
 
 计算方法：
 1. 对指数过去N个有效收盘价取自然对数；
 2. 用 t = 0, 1, ..., N-1 回归 log(P) = a + b * t；
 3. 计算窗口收益率、窗口波动率和回归R²；
-4. 同时计算三种得分：
+4. 同时计算两种得分：
    - 收益率×R²；
    - 收益率÷波动率；
-   - 收益率÷波动率×R²；
-5. 保留原“收益率×R²”的排名列，另外两种得分由回测脚本独立排名。
+5. 保留原“收益率×R²”的排名列，另一种得分由回测脚本独立排名。
 
 时间规则：
 - 月末动态指数池使用当月月末已知数据生成；
@@ -59,7 +58,7 @@ TREND_WINDOW = 20
 START_YEAR = 2021
 END_YEAR = 2026
 
-# 跨境指数的交易日与ETF市场可能不一致。允许使用不晚于当日的
+# 指数交易日与ETF市场可能不一致。允许使用不晚于当日的
 # 最新指数收盘价，但收盘价距当日超过该天数时因子记为数据不足。
 MAX_PRICE_STALENESS_CALENDAR_DAYS = 7
 # ====================================================================
@@ -127,7 +126,6 @@ OUTPUT_COLUMNS = [
     "R平方",
     "趋势质量因子",
     "风险调整趋势得分",
-    "风险调整R平方趋势得分",
     "因子排名",
     "排名百分比",
 ]
@@ -160,7 +158,6 @@ class TrendResult:
     r_squared: float
     trend_factor: float
     risk_adjusted_trend_factor: float
-    risk_adjusted_r_squared_trend_factor: float
 
 
 def clean_text(value: object) -> str:
@@ -432,9 +429,6 @@ def calculate_trend(
             r_squared=r_squared,
             trend_factor=window_return * r_squared,
             risk_adjusted_trend_factor=risk_adjusted_trend_factor,
-            risk_adjusted_r_squared_trend_factor=(
-                risk_adjusted_trend_factor * r_squared
-            ),
         ),
         "有效",
     )
@@ -497,10 +491,6 @@ def build_daily_rows(
                 "趋势质量因子": format(result.trend_factor, ".15g"),
                 "风险调整趋势得分": format(
                     result.risk_adjusted_trend_factor,
-                    ".15g",
-                ),
-                "风险调整R平方趋势得分": format(
-                    result.risk_adjusted_r_squared_trend_factor,
                     ".15g",
                 ),
                 "因子排名": rank,

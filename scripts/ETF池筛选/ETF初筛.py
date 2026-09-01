@@ -42,7 +42,7 @@ END_YEAR = 2026
 # 最后一个已经完整结束的自然月；不要填写仍在进行中的月份。
 END_MONTH = 7
 # 只处理这里指定的大类；以后增删类型只需要修改这个元组。
-SELECTED_MAJOR_CATEGORIES = ("股票型ETF", "跨境型ETF")
+SELECTED_MAJOR_CATEGORIES = ("股票型ETF")
 MIN_LISTED_YEARS = 1
 MIN_FUND_SCALE = 100_000_000.0
 TURNOVER_LOOKBACK_DAYS = 20
