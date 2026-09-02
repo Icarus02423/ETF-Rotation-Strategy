@@ -48,13 +48,13 @@ from openpyxl.utils import get_column_letter
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # ============================= 回测参数 =============================
-CLUSTER_CORRELATION_THRESHOLD = 0.8
-TREND_WINDOW = 40
+CLUSTER_CORRELATION_THRESHOLD = 0.9
+TREND_WINDOW = 20
 # 默认一次运行两种得分。若以后只想跑其中一种，可只保留对应英文键。
 SCORE_METHODS_TO_RUN = ("return_r2", "return_vol")
 TOP_PERCENT = 0.10
 # "rebalance"：全组合每x个交易日调仓；"staggered"：x个账户逐日错峰持有x日。
-REBALANCE_MODE = "rebalance"
+REBALANCE_MODE = "staggered"
 ACCOUNT_REBALANCE_INTERVAL = 1
 ACCOUNT_COUNT = (
     1 if REBALANCE_MODE == "rebalance" else ACCOUNT_REBALANCE_INTERVAL
