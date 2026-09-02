@@ -33,7 +33,7 @@ ETF_DATA_FILE = PROJECT_ROOT / "outputs" / "etf_data" / "etf_data.csv"
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "etf_strategy_test" / "trend_rank_ic"
 
 HOLDING_DAYS = tuple(range(1, 21))
-TOP_PERCENT = 0.10
+TOP_PERCENT = 0.20
 MIN_WINDOW_RETURN = 0.0
 
 SCORE_COLUMNS = {
