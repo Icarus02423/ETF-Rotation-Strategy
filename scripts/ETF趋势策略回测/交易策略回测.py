@@ -52,7 +52,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # ============================= 回测参数 =============================
 CLUSTER_CORRELATION_THRESHOLD = 0.9
-TREND_WINDOW = 20
+TREND_WINDOW = 15
 # 评价基准代码；需与“下载基准数据.py”中的BENCHMARK_CODE保持一致。
 BENCHMARK_CODE = "000510.CSI"
 # 默认一次运行两种得分。若以后只想跑其中一种，可只保留对应英文键。
@@ -60,14 +60,14 @@ SCORE_METHODS_TO_RUN = ("return_r2", "return_vol")
 TOP_PERCENT = 0.10
 # "rebalance"：全组合每x个交易日调仓；"staggered"：x个账户逐日错峰持有x日。
 REBALANCE_MODE = "staggered"
-ACCOUNT_REBALANCE_INTERVAL = 7
+ACCOUNT_REBALANCE_INTERVAL = 10
 ACCOUNT_COUNT = (
     1 if REBALANCE_MODE == "rebalance" else ACCOUNT_REBALANCE_INTERVAL
 )
 RSI_PERIOD = ACCOUNT_REBALANCE_INTERVAL
 BIAS_PERIOD = TREND_WINDOW
-RSI_NEUTRAL_LEVEL = 50.0
-BIAS_NEUTRAL_LEVEL = 0.0
+RSI_NEUTRAL_LEVEL = 60.0
+BIAS_NEUTRAL_LEVEL = -0.02
 MIN_WINDOW_RETURN = 0.0
 STRATEGY_VARIANT_DIR = "post_rank_positive_return_rsi_bias_filter"
 ACCOUNT_VARIANT_DIR = (
@@ -76,6 +76,10 @@ ACCOUNT_VARIANT_DIR = (
     else (
         f"staggered_{ACCOUNT_REBALANCE_INTERVAL}d"
     )
+)
+INDICATOR_VARIANT_DIR = (
+    f"rsi_{RSI_PERIOD}_gt_{RSI_NEUTRAL_LEVEL:g}"
+    f"__bias_{BIAS_PERIOD}_gt_{BIAS_NEUTRAL_LEVEL:g}"
 )
 TRANSACTION_COST_RATE = 0.001
 ANNUAL_TRADING_DAYS = 252
@@ -86,7 +90,7 @@ CAPACITY_DESCENDING_QUANTILE = 0.95
 # ====================================================================
 
 ALLOWED_CLUSTER_THRESHOLDS = (0.7, 0.8, 0.9)
-ALLOWED_TREND_WINDOWS = (20, 40, 60)
+ALLOWED_TREND_WINDOWS = (5, 10, 15)
 SCORE_COLUMNS = {
     "return_r2": "趋势质量因子",
     "return_vol": "风险调整趋势得分",
@@ -2819,6 +2823,7 @@ def main() -> None:
             / score_method
             / STRATEGY_VARIANT_DIR
             / ACCOUNT_VARIANT_DIR
+            / INDICATOR_VARIANT_DIR
         )
         print(f"\n开始回测：{score_label}（{score_column}）", flush=True)
 

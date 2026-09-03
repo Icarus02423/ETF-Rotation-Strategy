@@ -50,10 +50,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # ============================= 因子参数 =============================
 # 聚类结果阈值，可改为0.7、0.8或0.9。
-CLUSTER_CORRELATION_THRESHOLD = 0.9
+CLUSTER_CORRELATION_THRESHOLD = 0.7
 
-# 趋势回归窗口，可改为20、40或60。
-TREND_WINDOW = 20
+# 趋势回归窗口，可改为5, 10 或 15。
+TREND_WINDOW = 15
 
 START_YEAR = 2021
 END_YEAR = 2026
@@ -64,7 +64,7 @@ MAX_PRICE_STALENESS_CALENDAR_DAYS = 7
 # ====================================================================
 
 ALLOWED_CLUSTER_THRESHOLDS = (0.7, 0.8, 0.9)
-ALLOWED_TREND_WINDOWS = (20, 40, 60)
+ALLOWED_TREND_WINDOWS = (5, 10, 15)
 
 CLUSTER_POOL_DIR = (
     PROJECT_ROOT
