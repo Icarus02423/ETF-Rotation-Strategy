@@ -5,7 +5,8 @@ ETF趋势轮动策略回测。
 
 策略：
 1. 分别按两种趋势得分降序选择前10%的代表指数；
-2. 排名后仅保留当前趋势窗口收益率大于0的指数，不向后补选；
+2. 排名后仅保留当前趋势窗口收益率大于0、RSI大于50且乖离率大于0的指数，
+   RSI周期与单账户调仓间隔绑定，乖离率周期与趋势窗口绑定，不向后补选；
 3. 对每个保留指数，在当日所有跟踪该指数且成交量大于0的ETF中，
    选择成交量最大者；成交量相同时依次比较成交额、规模和ETF代码；
 4. 单个指数权重按过滤前计划入选数量等权，空缺权重保留为现金；
@@ -16,12 +17,13 @@ ETF趋势轮动策略回测。
 
 输入：
 - outputs/etf_trend_strategy/threshold_<阈值>/factors/window_<窗口>/YYYY.csv
+- outputs/etf_trend_strategy/threshold_<阈值>/index_prices/*.csv
 - outputs/etf_data/etf_data.csv
 - outputs/benchmark_data/*.csv（按BENCHMARK_CODE选择）
 
 输出：
-- 固定x日：post_rank_positive_return/rebalance_<x>d/<成交方式>/
-- x账户错峰：post_rank_positive_return/staggered_<x>_accounts_hold_<x>d/<成交方式>/
+- 固定x日：post_rank_positive_return_rsi_bias_filter/rebalance_<x>d/<成交方式>/
+- x账户错峰：post_rank_positive_return_rsi_bias_filter/staggered_<x>d/<成交方式>/
   每个交易模式独立输出年度指标、总回测指标、合并持仓、时序和账户明细五个Excel，
   以及累计净值、累计超额、换手率、累计交易成本和策略容量五张图。
 """
@@ -58,12 +60,16 @@ SCORE_METHODS_TO_RUN = ("return_r2", "return_vol")
 TOP_PERCENT = 0.10
 # "rebalance"：全组合每x个交易日调仓；"staggered"：x个账户逐日错峰持有x日。
 REBALANCE_MODE = "staggered"
-ACCOUNT_REBALANCE_INTERVAL = 10
+ACCOUNT_REBALANCE_INTERVAL = 7
 ACCOUNT_COUNT = (
     1 if REBALANCE_MODE == "rebalance" else ACCOUNT_REBALANCE_INTERVAL
 )
+RSI_PERIOD = ACCOUNT_REBALANCE_INTERVAL
+BIAS_PERIOD = TREND_WINDOW
+RSI_NEUTRAL_LEVEL = 50.0
+BIAS_NEUTRAL_LEVEL = 0.0
 MIN_WINDOW_RETURN = 0.0
-STRATEGY_VARIANT_DIR = "post_rank_positive_return"
+STRATEGY_VARIANT_DIR = "post_rank_positive_return_rsi_bias_filter"
 ACCOUNT_VARIANT_DIR = (
     f"rebalance_{ACCOUNT_REBALANCE_INTERVAL}d"
     if REBALANCE_MODE == "rebalance"
@@ -97,6 +103,13 @@ FACTOR_DIR = (
     / "factors"
     / f"window_{TREND_WINDOW}"
 )
+INDEX_PRICE_DIR = (
+    PROJECT_ROOT
+    / "outputs"
+    / "etf_trend_strategy"
+    / f"threshold_{CLUSTER_CORRELATION_THRESHOLD:g}"
+    / "index_prices"
+)
 ETF_DATA_FILE = PROJECT_ROOT / "outputs" / "etf_data" / "etf_data.csv"
 BENCHMARK_DIR = PROJECT_ROOT / "outputs" / "benchmark_data"
 BACKTEST_DIR = (
@@ -112,8 +125,10 @@ FACTOR_REQUIRED_COLUMNS = {
     "日期",
     "对标指数代码",
     "对标指数",
+    "窗口结束日",
     "窗口收益率",
 } | set(SCORE_COLUMNS.values())
+INDEX_PRICE_REQUIRED_COLUMNS = {"收益日期", "对标指数代码", "收盘价"}
 ETF_REQUIRED_COLUMNS = {
     "日期",
     "代码",
@@ -133,6 +148,7 @@ BENCHMARK_REQUIRED_COLUMNS = {"日期", "代码", "名称", "收盘价"}
 @dataclass(frozen=True)
 class FactorMember:
     signal_date: date
+    window_end_date: date
     index_code: str
     index_name: str
     trend_factor: float
@@ -384,6 +400,131 @@ def positive_float(value: object) -> float | None:
     return number if number is not None and number > 0 else None
 
 
+def calculate_wilder_rsi(
+    closes: Sequence[float],
+    period: int,
+) -> list[float | None]:
+    values: list[float | None] = [None] * len(closes)
+    if len(closes) <= period:
+        return values
+
+    gains: list[float] = []
+    losses: list[float] = []
+    for position in range(1, period + 1):
+        change = closes[position] - closes[position - 1]
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
+    average_gain = statistics.fmean(gains)
+    average_loss = statistics.fmean(losses)
+
+    def rsi_value() -> float:
+        if average_gain == 0 and average_loss == 0:
+            return 50.0
+        if average_loss == 0:
+            return 100.0
+        relative_strength = average_gain / average_loss
+        return 100.0 - 100.0 / (1.0 + relative_strength)
+
+    values[period] = rsi_value()
+    for position in range(period + 1, len(closes)):
+        change = closes[position] - closes[position - 1]
+        gain = max(change, 0.0)
+        loss = max(-change, 0.0)
+        average_gain = (average_gain * (period - 1) + gain) / period
+        average_loss = (average_loss * (period - 1) + loss) / period
+        values[position] = rsi_value()
+    return values
+
+
+def calculate_bias(
+    closes: Sequence[float],
+    period: int,
+) -> list[float | None]:
+    values: list[float | None] = [None] * len(closes)
+    rolling_sum = 0.0
+    for position, close in enumerate(closes):
+        rolling_sum += close
+        if position >= period:
+            rolling_sum -= closes[position - period]
+        if position >= period - 1:
+            moving_average = rolling_sum / period
+            values[position] = close / moving_average - 1.0
+    return values
+
+
+def load_defensive_indicators(
+    required_index_codes: set[str],
+) -> dict[tuple[str, date], tuple[float, float]]:
+    if not INDEX_PRICE_DIR.exists():
+        raise FileNotFoundError(f"找不到指数行情目录：{INDEX_PRICE_DIR}")
+    files = sorted(
+        path
+        for path in INDEX_PRICE_DIR.glob("*.csv")
+        if not path.name.startswith(".")
+    )
+    if not files:
+        raise FileNotFoundError(f"指数行情目录没有CSV：{INDEX_PRICE_DIR}")
+
+    prices_by_index: dict[str, dict[date, float]] = defaultdict(dict)
+    for path in files:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            missing = INDEX_PRICE_REQUIRED_COLUMNS - set(reader.fieldnames or [])
+            if missing:
+                raise ValueError(f"{path.name}缺少列：{sorted(missing)}")
+            for row_number, row in enumerate(reader, start=2):
+                index_code = clean_text(row.get("对标指数代码"))
+                if index_code not in required_index_codes:
+                    continue
+                close = positive_float(row.get("收盘价"))
+                if close is None:
+                    continue
+                price_date = parse_date(row.get("收益日期"), "收益日期")
+                existing_close = prices_by_index[index_code].get(price_date)
+                if existing_close is not None and not math.isclose(
+                    existing_close,
+                    close,
+                    rel_tol=1e-10,
+                    abs_tol=1e-8,
+                ):
+                    raise ValueError(
+                        f"{path.name}第{row_number}行与其他文件的指数收盘价冲突："
+                        f"{price_date} {index_code}"
+                    )
+                prices_by_index[index_code][price_date] = close
+
+    missing_indexes = sorted(required_index_codes - set(prices_by_index))
+    if missing_indexes:
+        raise ValueError(
+            "指数行情中缺少因子指数：" + ",".join(missing_indexes[:10])
+        )
+
+    indicators: dict[tuple[str, date], tuple[float, float]] = {}
+    for index_code, daily_prices in prices_by_index.items():
+        price_dates = sorted(daily_prices)
+        closes = [daily_prices[price_date] for price_date in price_dates]
+        rsi_values = calculate_wilder_rsi(closes, RSI_PERIOD)
+        bias_values = calculate_bias(closes, BIAS_PERIOD)
+        for price_date, rsi, bias in zip(price_dates, rsi_values, bias_values):
+            if rsi is not None and bias is not None:
+                indicators[(index_code, price_date)] = (rsi, bias)
+    return indicators
+
+
+def passes_defensive_filter(
+    member: FactorMember,
+    indicators: Mapping[tuple[str, date], tuple[float, float]],
+) -> bool:
+    values = indicators.get((member.index_code, member.window_end_date))
+    if values is None:
+        raise ValueError(
+            "无法计算防守指标："
+            f"{member.window_end_date} {member.index_code}"
+        )
+    rsi, bias = values
+    return rsi > RSI_NEUTRAL_LEVEL and bias > BIAS_NEUTRAL_LEVEL
+
+
 def load_benchmark_data() -> BenchmarkData:
     """按BENCHMARK_CODE读取基准文件，并严格校验基础口径。"""
 
@@ -549,6 +690,8 @@ def validate_parameters() -> None:
         or ACCOUNT_REBALANCE_INTERVAL <= 0
     ):
         raise ValueError("ACCOUNT_REBALANCE_INTERVAL必须是正整数")
+    if RSI_PERIOD < 2:
+        raise ValueError("由单账户调仓间隔绑定的RSI周期必须至少为2")
     expected_account_count = (
         1 if REBALANCE_MODE == "rebalance" else ACCOUNT_REBALANCE_INTERVAL
     )
@@ -595,6 +738,7 @@ def read_daily_top_factors(
                 if factor is None or window_return is None or not index_code:
                     continue
                 signal_date = parse_date(row.get("日期"), "日期")
+                window_end_date = parse_date(row.get("窗口结束日"), "窗口结束日")
                 if index_code in members_by_date[signal_date]:
                     raise ValueError(
                         f"{path.name}第{row_number}行出现重复指数："
@@ -602,11 +746,19 @@ def read_daily_top_factors(
                     )
                 members_by_date[signal_date][index_code] = FactorMember(
                     signal_date=signal_date,
+                    window_end_date=window_end_date,
                     index_code=index_code,
                     index_name=clean_text(row.get("对标指数")),
                     trend_factor=factor,
                     window_return=window_return,
                 )
+
+    required_index_codes = {
+        member.index_code
+        for daily_members in members_by_date.values()
+        for member in daily_members.values()
+    }
+    defensive_indicators = load_defensive_indicators(required_index_codes)
 
     daily_selections: dict[date, DailyFactorSelection] = {}
     for signal_date in sorted(members_by_date):
@@ -620,6 +772,7 @@ def read_daily_top_factors(
         ranked_members = tuple(
             FactorMember(
                 signal_date=member.signal_date,
+                window_end_date=member.window_end_date,
                 index_code=member.index_code,
                 index_name=member.index_name,
                 trend_factor=member.trend_factor,
@@ -633,6 +786,7 @@ def read_daily_top_factors(
             member
             for member in top_members
             if member.window_return > MIN_WINDOW_RETURN
+            and passes_defensive_filter(member, defensive_indicators)
         )
         daily_selections[signal_date] = DailyFactorSelection(
             signal_date=signal_date,
@@ -1987,7 +2141,11 @@ def write_backtest_metrics_workbook(
         ["趋势策略", "排名得分公式", SCORE_LABELS[score_method]],
         ["趋势策略", "调仓日入选比例", TOP_PERCENT],
         ["趋势过滤", "过滤位置", "排名后"],
-        ["趋势过滤", "过滤条件", "当前趋势窗口收益率>0"],
+        ["趋势过滤", "正收益条件", "当前趋势窗口收益率>0"],
+        ["防守过滤", "RSI周期（绑定调仓间隔）", RSI_PERIOD],
+        ["防守过滤", "RSI条件", f"RSI{RSI_PERIOD}>50"],
+        ["防守过滤", "BIAS周期（绑定趋势窗口）", BIAS_PERIOD],
+        ["防守过滤", "BIAS条件", f"BIAS{BIAS_PERIOD}>0"],
         ["趋势过滤", "未通过处理", "不向后补选，空缺权重留现金"],
         ["ETF选择", "代表ETF选择", "跟踪同一指数中当日成交量最大"],
         ["账户结构", "调仓模式", REBALANCE_MODE],
@@ -2641,7 +2799,9 @@ def main() -> None:
     print(
         f"聚类阈值 {CLUSTER_CORRELATION_THRESHOLD:g}，"
         f"趋势窗口 {TREND_WINDOW}，选择调仓信号日得分前 {TOP_PERCENT:.0%}；"
-        f"排名后过滤窗口收益率不大于 {MIN_WINDOW_RETURN:g} 的指数，"
+        f"排名后过滤窗口收益率不大于 {MIN_WINDOW_RETURN:g}、"
+        f"RSI{RSI_PERIOD}不大于 {RSI_NEUTRAL_LEVEL:g} 或"
+        f"BIAS{BIAS_PERIOD}不大于 {BIAS_NEUTRAL_LEVEL:g} 的指数，"
         f"{rebalance_description}；"
         "本次依次回测两种得分公式。",
         flush=True,
@@ -2708,7 +2868,7 @@ def main() -> None:
         print(
             f"共 {len(trading_dates)} 个实际ETF交易日，"
             f"实际涉及 {len(selected_codes)} 只ETF，"
-            f"排名后过滤指数-日期记录 {filtered_count} 条，"
+            f"正收益/RSI/BIAS过滤指数-日期记录 {filtered_count} 条，"
             f"无法映射的指数-日期记录 {unmapped_count} 条。",
             flush=True,
         )

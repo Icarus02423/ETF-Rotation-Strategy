@@ -3,8 +3,8 @@
 核心口径：
 1. 因子在信号日收盘后形成，下一ETF交易日按VWAP买入，持有1至20个交易日后
    按VWAP卖出；ETF收益同时输出扣费前和按双边0.1%成本估算的扣费后结果。
-2. 全池Rank IC用于判断因子整体单调性；正收益池、前20%和前10%局部Rank IC
-   用于观察策略候选区间，但小样本日期会明确标记而不是强行计算。
+2. 全池Rank IC用于判断因子整体单调性；局部Rank IC直接使用交易策略回测脚本
+   生成的最终策略池，小样本日期会明确标记而不是强行计算。
 3. 同时使用ETF的VWAP未来收益和对标指数的收盘未来收益。前者贴近交易，后者
    用于隔离代表ETF选择、溢折价和跟踪误差带来的噪声。
 4. 除Rank IC外，输出Q1至Q5分组收益、Q5-Q1、多头候选组合、年度与滚动稳定性、
@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import csv
 import heapq
+import importlib.util
 import math
+import sys
 from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
@@ -36,21 +38,37 @@ from openpyxl.utils import get_column_letter
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+BACKTEST_FILE = PROJECT_ROOT / "scripts" / "ETF趋势策略回测" / "交易策略回测.py"
+
+
+def load_backtest_module():
+    """加载回测脚本，使因子检验直接复用其参数与最终选池逻辑。"""
+
+    spec = importlib.util.spec_from_file_location(
+        "etf_trend_backtest_for_rank_ic",
+        BACKTEST_FILE,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载交易策略回测脚本：{BACKTEST_FILE}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+BACKTEST = load_backtest_module()
 FACTOR_ROOT = PROJECT_ROOT / "outputs" / "etf_trend_strategy"
-ETF_DATA_FILE = PROJECT_ROOT / "outputs" / "etf_data" / "etf_data.csv"
+FACTOR_DIR = Path(BACKTEST.FACTOR_DIR)
+ETF_DATA_FILE = Path(BACKTEST.ETF_DATA_FILE)
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "etf_strategy_test" / "trend_rank_ic"
 
 HOLDING_DAYS = tuple(range(1, 21))
-MIN_WINDOW_RETURN = 0.0
-LOCAL_SCOPE_PERCENTAGES = {
-    "前20%策略池": 0.20,
-    "前10%策略池": 0.10,
-}
 MIN_CROSS_SECTION = 5
 QUANTILE_COUNT = 5
 ROLLING_IC_WINDOW = 60
-ROLLING_HOLDING_DAYS = (1, 5, 10, 20)
-TRANSACTION_COST_RATE = 0.001
+CURRENT_HOLDING_DAY = int(BACKTEST.ACCOUNT_REBALANCE_INTERVAL)
+ROLLING_HOLDING_DAYS = tuple(sorted({1, 5, 10, 20, CURRENT_HOLDING_DAY}))
+TRANSACTION_COST_RATE = float(BACKTEST.TRANSACTION_COST_RATE)
 ANNUAL_TRADING_DAYS = 252
 MAX_ANOMALY_ROWS = 300
 EXCEL_MAX_DATA_ROWS = 1_048_575
@@ -58,15 +76,22 @@ EXCEL_MAX_DATA_ROWS = 1_048_575
 RETURN_BASIS_ETF = "ETF次日VWAP"
 RETURN_BASIS_INDEX = "对标指数收盘"
 SCOPE_ALL = "全池"
-SCOPE_POSITIVE = "窗口收益率>0"
+SCOPE_STRATEGY = "当前回测策略池"
 
 SCORE_COLUMNS = {
-    "收益率×R平方": "趋势质量因子",
-    "收益率÷波动率": "风险调整趋势得分",
+    BACKTEST.SCORE_LABELS[method]: BACKTEST.SCORE_COLUMNS[method]
+    for method in BACKTEST.SCORE_METHODS_TO_RUN
+}
+OUTPUT_FILE_NAMES = {
+    "return_r2": "01_收益率乘R平方.xlsx",
+    "return_vol": "02_收益率除以波动率.xlsx",
 }
 OUTPUT_FILES = {
-    "收益率×R平方": OUTPUT_DIR / "01_收益率乘R平方.xlsx",
-    "收益率÷波动率": OUTPUT_DIR / "02_收益率除以波动率.xlsx",
+    BACKTEST.SCORE_LABELS[method]: OUTPUT_DIR / OUTPUT_FILE_NAMES.get(
+        method,
+        f"{method}.xlsx",
+    )
+    for method in BACKTEST.SCORE_METHODS_TO_RUN
 }
 FACTOR_COLUMNS = {"日期", "对标指数代码", "窗口收益率"} | set(SCORE_COLUMNS.values())
 ETF_COLUMNS = {
@@ -88,6 +113,14 @@ class CandidateETF:
     volume: float
     amount: float
     scale: float
+
+
+@dataclass(frozen=True)
+class StrategyContext:
+    index_codes_by_date: dict[date, set[str]]
+    candidates_by_date_index: dict[tuple[date, str], CandidateETF]
+    target_weights_by_date_index: dict[tuple[date, str], float]
+    planned_count_by_date: dict[date, int]
 
 
 @dataclass(frozen=True)
@@ -274,6 +307,51 @@ def load_factor_signals() -> pd.DataFrame:
     if signals.empty:
         raise ValueError("因子CSV中没有可用于Rank IC检验的有效记录")
     return signals
+
+
+def build_strategy_context(score_method: str) -> StrategyContext:
+    """直接调用回测函数，取得过滤、映射后的每日最终策略池。"""
+
+    daily_selections = BACKTEST.read_daily_top_factors(SCORE_COLUMNS[score_method])
+    daily_targets, _ = BACKTEST.build_daily_targets(
+        daily_selections,
+        ETF_DATA_FILE,
+    )
+    index_codes_by_date: dict[date, set[str]] = {}
+    candidates_by_date_index: dict[tuple[date, str], CandidateETF] = {}
+    target_weights_by_date_index: dict[tuple[date, str], float] = {}
+    planned_count_by_date: dict[date, int] = {}
+    for signal_date, target in daily_targets.items():
+        planned_count_by_date[signal_date] = int(target.planned_index_count)
+        index_codes_by_date[signal_date] = {
+            member.index_code for member in target.members
+        }
+        for member in target.members:
+            candidates_by_date_index[(signal_date, member.index_code)] = CandidateETF(
+                code=member.etf_code,
+                volume=float(member.selection_volume),
+                amount=float(member.selection_amount),
+                scale=float(member.selection_scale),
+            )
+            target_weights_by_date_index[(signal_date, member.index_code)] = float(
+                member.target_weight
+            )
+    return StrategyContext(
+        index_codes_by_date=index_codes_by_date,
+        candidates_by_date_index=candidates_by_date_index,
+        target_weights_by_date_index=target_weights_by_date_index,
+        planned_count_by_date=planned_count_by_date,
+    )
+
+
+def apply_strategy_mappings(
+    mapping: dict[tuple[date, str], CandidateETF],
+    strategy_contexts: Iterable[StrategyContext],
+) -> None:
+    """用回测函数选出的实际ETF覆盖局部策略池映射。"""
+
+    for context in strategy_contexts:
+        mapping.update(context.candidates_by_date_index)
 
 
 def scan_etf_mapping(
@@ -545,24 +623,28 @@ def newey_west_statistics(
     }
 
 
-def scope_index_codes(group: pd.DataFrame) -> dict[str, set[str]]:
-    """先按分数划定候选池，再做正收益过滤；不从池外补位。"""
+def scope_index_codes(
+    group: pd.DataFrame,
+    signal_date: date,
+    threshold: float,
+    trend_window: int,
+    strategy_context: StrategyContext,
+) -> dict[str, set[str]]:
+    """所有参数检验全池；仅回测当前参数增加最终策略池。"""
 
-    ranked = group.sort_values(
-        ["score", "index_code"],
-        ascending=[False, True],
-    )
-    scopes = {
-        SCOPE_ALL: set(ranked["index_code"]),
-        SCOPE_POSITIVE: set(
-            ranked.loc[ranked["window_return"] > MIN_WINDOW_RETURN, "index_code"]
-        ),
-    }
-    for scope_name, percentage in LOCAL_SCOPE_PERCENTAGES.items():
-        planned_count = max(1, math.ceil(len(ranked) * percentage))
-        selected = ranked.head(planned_count)
-        selected = selected[selected["window_return"] > MIN_WINDOW_RETURN]
-        scopes[scope_name] = set(selected["index_code"])
+    scopes = {SCOPE_ALL: set(group["index_code"])}
+    if (
+        math.isclose(
+            threshold,
+            float(BACKTEST.CLUSTER_CORRELATION_THRESHOLD),
+            abs_tol=1e-12,
+        )
+        and trend_window == int(BACKTEST.TREND_WINDOW)
+    ):
+        scopes[SCOPE_STRATEGY] = strategy_context.index_codes_by_date.get(
+            signal_date,
+            set(),
+        )
     return scopes
 
 
@@ -612,6 +694,26 @@ def calculate_factor_distribution(signals: pd.DataFrame) -> pd.DataFrame:
 def build_parameters(score_method: str) -> pd.DataFrame:
     rows = [
         ("得分公式", score_method, SCORE_COLUMNS[score_method]),
+        (
+            "回测参数来源",
+            str(BACKTEST_FILE.relative_to(PROJECT_ROOT)),
+            "运行时直接加载，不在本脚本重复维护策略参数",
+        ),
+        (
+            "局部策略池配置",
+            (
+                f"阈值{BACKTEST.CLUSTER_CORRELATION_THRESHOLD:g} / "
+                f"窗口{BACKTEST.TREND_WINDOW} / "
+                f"Top {BACKTEST.TOP_PERCENT:.0%} / "
+                f"{BACKTEST.REBALANCE_MODE} {BACKTEST.ACCOUNT_REBALANCE_INTERVAL}日"
+            ),
+            "修改回测脚本参数后，当前策略池检验自动同步",
+        ),
+        (
+            "全池参数范围",
+            "扫描全部threshold_* / window_*因子目录",
+            "当前包含0.7、0.8、0.9与20、40、60的组合",
+        ),
         ("因子形成时点", "信号日收盘后", "避免使用同日尚未完成的数据交易"),
         ("ETF买入价", "下一ETF交易日VWAP", "可交易收益主口径"),
         ("ETF卖出价", "持有1至20个ETF交易日后的VWAP", "固定持有期"),
@@ -619,12 +721,17 @@ def build_parameters(score_method: str) -> pd.DataFrame:
         ("主Rank IC范围", SCOPE_ALL, "判断整个截面的排序能力"),
         (
             "局部检验范围",
-            "窗口收益率>0、前20%、前10%",
-            "先按分数选池，再过滤窗口收益率<=0，不补位",
+            SCOPE_STRATEGY,
+            "直接调用回测的最终选池与ETF映射函数，不再单独计算20%或10%池",
         ),
         ("最小截面样本", MIN_CROSS_SECTION, "不足时保留记录但不计算IC"),
         ("Q1-Q5方向", "Q1最低分，Q5最高分", "全池等权分组"),
         ("交易成本", TRANSACTION_COST_RATE, "买入和卖出各0.1%"),
+        (
+            "策略池组合权重",
+            "直接使用回测目标权重",
+            "当前为按过滤前计划数量等权，空缺权重按现金0收益处理",
+        ),
         ("Q5-Q1扣费后", "毛收益减4倍单边费率", "多空两端各完成一次买卖"),
         ("显著性", "Newey-West", "滞后阶数=持有期-1"),
         ("滚动窗口", ROLLING_IC_WINDOW, "按有效信号日观测滚动"),
@@ -649,6 +756,7 @@ def add_extreme_return(
 def research_score_method(
     signals: pd.DataFrame,
     score_method: str,
+    strategy_context: StrategyContext,
     mapping: dict[tuple[date, str], CandidateETF],
     schedule: dict[tuple[date, int], tuple[date, date]],
     etf_prices: dict[tuple[date, str], float],
@@ -692,7 +800,13 @@ def research_score_method(
         group = group.sort_values(
             ["score", "index_code"], ascending=[False, True]
         ).reset_index(drop=True)
-        scopes = scope_index_codes(group)
+        scopes = scope_index_codes(
+            group,
+            signal_date,
+            threshold,
+            trend_window,
+            strategy_context,
+        )
 
         for holding_day in HOLDING_DAYS:
             coverage_key = (threshold, trend_window, holding_day)
@@ -718,22 +832,21 @@ def research_score_method(
                         )
                         ic_attempts[key] += 1
                         ic_sample_sizes[key].append(0)
-                for return_basis in (RETURN_BASIS_ETF, RETURN_BASIS_INDEX):
-                    daily_ic_records.append(
-                        {
-                            "信号日": signal_date,
-                            "买入日": None,
-                            "卖出日": None,
-                            "聚类阈值": threshold,
-                            "趋势窗口": trend_window,
-                            "持有期(交易日)": holding_day,
-                            "检验范围": SCOPE_ALL,
-                            "收益口径": return_basis,
-                            "有效样本数": 0,
-                            "RankIC": None,
-                            "状态": "无完整持有期",
-                        }
-                    )
+                        daily_ic_records.append(
+                            {
+                                "信号日": signal_date,
+                                "买入日": None,
+                                "卖出日": None,
+                                "聚类阈值": threshold,
+                                "趋势窗口": trend_window,
+                                "持有期(交易日)": holding_day,
+                                "检验范围": scope_name,
+                                "收益口径": return_basis,
+                                "有效样本数": 0,
+                                "RankIC": None,
+                                "状态": "无完整持有期",
+                            }
+                        )
                 continue
 
             stats.scheduled_days += 1
@@ -861,22 +974,21 @@ def research_score_method(
                         ic_series[key].append(
                             (signal_date, rank_ic, len(valid_pairs))
                         )
-                    if scope_name == SCOPE_ALL:
-                        daily_ic_records.append(
-                            {
-                                "信号日": signal_date,
-                                "买入日": entry_date,
-                                "卖出日": exit_date,
-                                "聚类阈值": threshold,
-                                "趋势窗口": trend_window,
-                                "持有期(交易日)": holding_day,
-                                "检验范围": scope_name,
-                                "收益口径": return_basis,
-                                "有效样本数": len(valid_pairs),
-                                "RankIC": rank_ic,
-                                "状态": status,
-                            }
-                        )
+                    daily_ic_records.append(
+                        {
+                            "信号日": signal_date,
+                            "买入日": entry_date,
+                            "卖出日": exit_date,
+                            "聚类阈值": threshold,
+                            "趋势窗口": trend_window,
+                            "持有期(交易日)": holding_day,
+                            "检验范围": scope_name,
+                            "收益口径": return_basis,
+                            "有效样本数": len(valid_pairs),
+                            "RankIC": rank_ic,
+                            "状态": status,
+                        }
+                    )
 
             ranked_scores = pd.Series(
                 {asset.index_code: asset.score for asset in assets},
@@ -967,59 +1079,69 @@ def research_score_method(
                         )
                     ),
                 }
-                for scope_name in LOCAL_SCOPE_PERCENTAGES:
-                    selected_assets = [
-                        assets_by_code[index_code]
-                        for index_code in scopes[scope_name]
-                        if index_code in assets_by_code
-                        and assets_by_code[index_code].etf_gross_return is not None
-                    ]
-                    if not selected_assets:
-                        continue
-                    selected_returns = {
-                        "扣费前": float(
-                            np.mean(
-                                [
-                                    asset.etf_gross_return
-                                    for asset in selected_assets
-                                ]
-                            )
-                        ),
-                        "扣费后": float(
-                            np.mean(
-                                [asset.etf_net_return for asset in selected_assets]
-                            )
-                        ),
-                    }
-                    for cost_basis in ("扣费前", "扣费后"):
-                        portfolio_return = selected_returns[cost_basis]
-                        count = len(selected_assets)
-                        top_series[
-                            (
-                                threshold,
-                                trend_window,
-                                holding_day,
-                                scope_name,
-                                cost_basis,
-                                "组合收益",
-                            )
-                        ].append((signal_date, portfolio_return, count))
-                        top_series[
-                            (
-                                threshold,
-                                trend_window,
-                                holding_day,
-                                scope_name,
-                                cost_basis,
-                                "相对全池超额",
-                            )
-                        ].append(
-                            (
-                                signal_date,
-                                portfolio_return - full_returns[cost_basis],
-                                count,
-                            )
+                if SCOPE_STRATEGY not in scopes:
+                    continue
+                planned_count = strategy_context.planned_count_by_date.get(
+                    signal_date,
+                    0,
+                )
+                if planned_count <= 0:
+                    continue
+                selected_assets = [
+                    assets_by_code[index_code]
+                    for index_code in scopes[SCOPE_STRATEGY]
+                    if index_code in assets_by_code
+                    and assets_by_code[index_code].etf_gross_return is not None
+                ]
+                selected_returns = {
+                    "扣费前": float(
+                        sum(
+                            asset.etf_gross_return
+                            * strategy_context.target_weights_by_date_index[
+                                (signal_date, asset.index_code)
+                            ]
+                            for asset in selected_assets
                         )
+                    ),
+                    "扣费后": float(
+                        sum(
+                            asset.etf_net_return
+                            * strategy_context.target_weights_by_date_index[
+                                (signal_date, asset.index_code)
+                            ]
+                            for asset in selected_assets
+                        )
+                    ),
+                }
+                for cost_basis in ("扣费前", "扣费后"):
+                    portfolio_return = selected_returns[cost_basis]
+                    count = len(selected_assets)
+                    top_series[
+                        (
+                            threshold,
+                            trend_window,
+                            holding_day,
+                            SCOPE_STRATEGY,
+                            cost_basis,
+                            "组合收益",
+                        )
+                    ].append((signal_date, portfolio_return, count))
+                    top_series[
+                        (
+                            threshold,
+                            trend_window,
+                            holding_day,
+                            SCOPE_STRATEGY,
+                            cost_basis,
+                            "相对全池超额",
+                        )
+                    ].append(
+                        (
+                            signal_date,
+                            portfolio_return - full_returns[cost_basis],
+                            count,
+                        )
+                    )
 
     ic_summary_records: list[dict[str, object]] = []
     all_ic_keys = sorted(ic_attempts)
@@ -1065,14 +1187,19 @@ def research_score_method(
     ic_summary = pd.DataFrame.from_records(ic_summary_records)
 
     daily_ic = pd.DataFrame.from_records(daily_ic_records).sort_values(
-        ["聚类阈值", "趋势窗口", "收益口径", "持有期(交易日)", "信号日"]
+        [
+            "聚类阈值",
+            "趋势窗口",
+            "检验范围",
+            "收益口径",
+            "持有期(交易日)",
+            "信号日",
+        ]
     ).reset_index(drop=True)
 
     annual_records: list[dict[str, object]] = []
     for key, observations in sorted(ic_series.items()):
         threshold, trend_window, holding_day, scope_name, return_basis = key
-        if scope_name != SCOPE_ALL:
-            continue
         observations_by_year: dict[int, list[float]] = defaultdict(list)
         for signal_date, rank_ic, _ in observations:
             observations_by_year[signal_date.year].append(rank_ic)
@@ -1083,6 +1210,7 @@ def research_score_method(
                     "聚类阈值": threshold,
                     "趋势窗口": trend_window,
                     "持有期(交易日)": holding_day,
+                    "检验范围": scope_name,
                     "收益口径": return_basis,
                     "年份": year,
                     "有效IC日数": metrics["样本数"],
@@ -1100,7 +1228,7 @@ def research_score_method(
     rolling_min_periods = max(20, ROLLING_IC_WINDOW // 3)
     for key, observations in sorted(ic_series.items()):
         threshold, trend_window, holding_day, scope_name, return_basis = key
-        if scope_name != SCOPE_ALL or holding_day not in ROLLING_HOLDING_DAYS:
+        if holding_day not in ROLLING_HOLDING_DAYS:
             continue
         observations = sorted(observations)
         series = pd.Series(
@@ -1124,6 +1252,7 @@ def research_score_method(
                     "聚类阈值": threshold,
                     "趋势窗口": trend_window,
                     "持有期(交易日)": holding_day,
+                    "检验范围": scope_name,
                     "收益口径": return_basis,
                     "滚动窗口": ROLLING_IC_WINDOW,
                     "滚动RankIC均值": float(mean),
@@ -1241,13 +1370,14 @@ def research_score_method(
         "聚类阈值",
         "趋势窗口",
         "持有期(交易日)",
+        "检验范围",
         "RankIC均值",
         "有效IC日数",
         "NW_t值",
         "NW_p值",
     ]
     for row in ic_summary.loc[
-        ic_summary["检验范围"].eq(SCOPE_ALL)
+        ic_summary["检验范围"].isin((SCOPE_ALL, SCOPE_STRATEGY))
         & ic_summary["收益口径"].eq(RETURN_BASIS_ETF),
         ic_robustness_columns,
     ].itertuples(index=False, name=None):
@@ -1255,6 +1385,7 @@ def research_score_method(
             threshold,
             trend_window,
             holding_day,
+            scope_name,
             mean_value,
             valid_days,
             t_value,
@@ -1262,11 +1393,11 @@ def research_score_method(
         ) = row
         robustness_records.append(
             {
-                "检验项": "全池ETF RankIC",
+                "检验项": f"{scope_name}ETF RankIC",
                 "聚类阈值": threshold,
                 "趋势窗口": trend_window,
                 "持有期(交易日)": holding_day,
-                "候选范围": SCOPE_ALL,
+                "候选范围": scope_name,
                 "成本口径": "不适用",
                 "均值": mean_value,
                 "有效日数": valid_days,
@@ -1445,6 +1576,50 @@ def save_ic_decay_chart(frames: ResearchFrames, output_file: Path) -> None:
     plt.close(figure)
 
 
+def save_strategy_ic_decay_chart(
+    frames: ResearchFrames,
+    output_file: Path,
+) -> None:
+    if frames.ic_summary.empty:
+        return
+    data = frames.ic_summary.loc[
+        frames.ic_summary["检验范围"].eq(SCOPE_STRATEGY)
+        & frames.ic_summary["收益口径"].eq(RETURN_BASIS_ETF)
+    ]
+    if data.empty:
+        return
+    figure, axis = plt.subplots(figsize=(12, 7))
+    for (threshold, trend_window), group in data.groupby(
+        ["聚类阈值", "趋势窗口"], sort=True
+    ):
+        axis.plot(
+            group["持有期(交易日)"],
+            group["RankIC均值"],
+            marker="o",
+            markersize=3,
+            linewidth=1.3,
+            label=f"阈值{threshold:g}/窗口{trend_window}",
+        )
+    axis.axhline(0, color="black", linewidth=0.8)
+    axis.axvline(
+        CURRENT_HOLDING_DAY,
+        color="tab:red",
+        linestyle="--",
+        linewidth=1,
+        label=f"当前调仓间隔{CURRENT_HOLDING_DAY}日",
+    )
+    axis.set(
+        title="当前回测策略池ETF RankIC衰减",
+        xlabel="持有期（交易日）",
+        ylabel="RankIC均值",
+    )
+    axis.grid(alpha=0.25)
+    axis.legend(ncol=3, fontsize=8)
+    figure.tight_layout()
+    figure.savefig(output_file, dpi=180)
+    plt.close(figure)
+
+
 def save_quantile_chart(frames: ResearchFrames, output_file: Path) -> None:
     if frames.quantile_returns.empty:
         return
@@ -1500,22 +1675,26 @@ def save_rolling_ic_chart(frames: ResearchFrames, output_file: Path) -> None:
         return
     data = frames.rolling_ic.loc[
         frames.rolling_ic["收益口径"].eq(RETURN_BASIS_ETF)
-        & frames.rolling_ic["持有期(交易日)"].eq(10)
+        & frames.rolling_ic["持有期(交易日)"].eq(CURRENT_HOLDING_DAY)
     ]
     if data.empty:
         return
     figure, axis = plt.subplots(figsize=(13, 7))
-    for (threshold, trend_window), group in data.groupby(
-        ["聚类阈值", "趋势窗口"], sort=True
+    for (scope_name, threshold, trend_window), group in data.groupby(
+        ["检验范围", "聚类阈值", "趋势窗口"], sort=True
     ):
         axis.plot(
             pd.to_datetime(group["信号日"]),
             group["滚动RankIC均值"],
             linewidth=1,
-            label=f"阈值{threshold:g}/窗口{trend_window}",
+            label=f"{scope_name}/阈值{threshold:g}/窗口{trend_window}",
         )
     axis.axhline(0, color="black", linewidth=0.8)
-    axis.set(title="60期滚动RankIC（持有10日）", xlabel="信号日", ylabel="滚动RankIC均值")
+    axis.set(
+        title=f"60期滚动RankIC（持有{CURRENT_HOLDING_DAY}日）",
+        xlabel="信号日",
+        ylabel="滚动RankIC均值",
+    )
     axis.grid(alpha=0.2)
     axis.legend(ncol=3, fontsize=8)
     figure.tight_layout()
@@ -1529,7 +1708,7 @@ def save_parameter_heatmap(frames: ResearchFrames, output_file: Path) -> None:
     data = frames.ic_summary.loc[
         frames.ic_summary["检验范围"].eq(SCOPE_ALL)
         & frames.ic_summary["收益口径"].eq(RETURN_BASIS_ETF)
-        & frames.ic_summary["持有期(交易日)"].eq(10)
+        & frames.ic_summary["持有期(交易日)"].eq(CURRENT_HOLDING_DAY)
     ]
     if data.empty:
         return
@@ -1544,7 +1723,11 @@ def save_parameter_heatmap(frames: ResearchFrames, output_file: Path) -> None:
     axis.set_yticks(
         range(len(matrix.index)), labels=[f"{value:g}" for value in matrix.index]
     )
-    axis.set(xlabel="趋势窗口", ylabel="聚类阈值", title="持有10日全池ETF RankIC参数热力图")
+    axis.set(
+        xlabel="趋势窗口",
+        ylabel="聚类阈值",
+        title=f"持有{CURRENT_HOLDING_DAY}日全池ETF RankIC参数热力图",
+    )
     for row_number in range(len(matrix.index)):
         for column_number in range(len(matrix.columns)):
             value = matrix.iloc[row_number, column_number]
@@ -1591,16 +1774,27 @@ def write_output(score_method: str, frames: ResearchFrames) -> None:
     configure_chinese_plotting()
     chart_prefix = output_file.with_suffix("")
     save_ic_decay_chart(frames, Path(f"{chart_prefix}_IC衰减.png"))
+    save_strategy_ic_decay_chart(
+        frames,
+        Path(f"{chart_prefix}_当前策略池IC衰减.png"),
+    )
     save_quantile_chart(frames, Path(f"{chart_prefix}_Q1-Q5.png"))
     save_rolling_ic_chart(frames, Path(f"{chart_prefix}_滚动IC.png"))
     save_parameter_heatmap(frames, Path(f"{chart_prefix}_参数热力图.png"))
 
 
 def main() -> None:
+    BACKTEST.validate_parameters()
     print("读取趋势因子……")
     signals = load_factor_signals()
+    print("调用回测脚本生成当前最终策略池……")
+    strategy_contexts = {
+        score_method: build_strategy_context(score_method)
+        for score_method in SCORE_COLUMNS
+    }
     print("扫描ETF数据并建立信号日映射……")
     mapping, trading_dates = scan_etf_mapping(signals)
+    apply_strategy_mappings(mapping, strategy_contexts.values())
     schedule = build_trade_schedule(set(signals["signal_date"]), trading_dates)
     required_prices = collect_required_prices(signals, mapping, schedule)
     print("读取计算未来收益所需的VWAP……")
@@ -1612,6 +1806,7 @@ def main() -> None:
         frames = research_score_method(
             signals,
             score_method,
+            strategy_contexts[score_method],
             mapping,
             schedule,
             etf_prices,
