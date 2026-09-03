@@ -55,7 +55,7 @@ SCORE_METHODS_TO_RUN = ("return_r2", "return_vol")
 TOP_PERCENT = 0.10
 # "rebalance"：全组合每x个交易日调仓；"staggered"：x个账户逐日错峰持有x日。
 REBALANCE_MODE = "staggered"
-ACCOUNT_REBALANCE_INTERVAL = 1
+ACCOUNT_REBALANCE_INTERVAL = 7
 ACCOUNT_COUNT = (
     1 if REBALANCE_MODE == "rebalance" else ACCOUNT_REBALANCE_INTERVAL
 )
