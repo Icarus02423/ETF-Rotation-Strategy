@@ -5,7 +5,7 @@ ETF趋势轮动策略回测。
 
 策略：
 1. 分别按两种趋势得分降序选择前10%的代表指数；
-2. 排名后仅保留当前趋势窗口收益率大于0、RSI大于50且乖离率大于0的指数，
+2. 排名后仅保留当前趋势窗口收益率大于0、RSI和乖离率均大于各自参数阈值的指数，
    RSI周期与单账户调仓间隔绑定，乖离率周期与趋势窗口绑定，不向后补选；
 3. 对每个保留指数，在当日所有跟踪该指数且成交量大于0的ETF中，
    选择成交量最大者；成交量相同时依次比较成交额、规模和ETF代码；
@@ -22,8 +22,9 @@ ETF趋势轮动策略回测。
 - outputs/benchmark_data/*.csv（按BENCHMARK_CODE选择）
 
 输出：
-- 固定x日：post_rank_positive_return_rsi_bias_filter/rebalance_<x>d/<成交方式>/
-- x账户错峰：post_rank_positive_return_rsi_bias_filter/staggered_<x>d/<成交方式>/
+- 固定x日：post_rank_positive_return_rsi_bias_filter/rebalance_<x>d/<RSI_BIAS参数>/<成交方式>/
+- x账户错峰：post_rank_positive_return_rsi_bias_filter/staggered_<x>d/<RSI_BIAS参数>/<成交方式>/
+  参数目录：rsi_<周期>_gt_<阈值>__bias_<周期>_gt_<阈值>。
   每个交易模式独立输出年度指标、总回测指标、合并持仓、时序和账户明细五个Excel，
   以及累计净值、累计超额、换手率、累计交易成本和策略容量五张图。
 """
@@ -60,14 +61,14 @@ SCORE_METHODS_TO_RUN = ("return_r2", "return_vol")
 TOP_PERCENT = 0.10
 # "rebalance"：全组合每x个交易日调仓；"staggered"：x个账户逐日错峰持有x日。
 REBALANCE_MODE = "staggered"
-ACCOUNT_REBALANCE_INTERVAL = 7
+ACCOUNT_REBALANCE_INTERVAL = 10
 ACCOUNT_COUNT = (
     1 if REBALANCE_MODE == "rebalance" else ACCOUNT_REBALANCE_INTERVAL
 )
 RSI_PERIOD = ACCOUNT_REBALANCE_INTERVAL
 BIAS_PERIOD = TREND_WINDOW
-RSI_NEUTRAL_LEVEL = 50.0
-BIAS_NEUTRAL_LEVEL = 0.0
+RSI_NEUTRAL_LEVEL = 55.0
+BIAS_NEUTRAL_LEVEL = 0.01
 MIN_WINDOW_RETURN = 0.0
 STRATEGY_VARIANT_DIR = "post_rank_positive_return_rsi_bias_filter"
 ACCOUNT_VARIANT_DIR = (
@@ -76,6 +77,10 @@ ACCOUNT_VARIANT_DIR = (
     else (
         f"staggered_{ACCOUNT_REBALANCE_INTERVAL}d"
     )
+)
+DEFENSE_VARIANT_DIR = (
+    f"rsi_{RSI_PERIOD}_gt_{RSI_NEUTRAL_LEVEL:g}__"
+    f"bias_{BIAS_PERIOD}_gt_{BIAS_NEUTRAL_LEVEL:g}"
 )
 TRANSACTION_COST_RATE = 0.001
 ANNUAL_TRADING_DAYS = 252
@@ -2143,9 +2148,9 @@ def write_backtest_metrics_workbook(
         ["趋势过滤", "过滤位置", "排名后"],
         ["趋势过滤", "正收益条件", "当前趋势窗口收益率>0"],
         ["防守过滤", "RSI周期（绑定调仓间隔）", RSI_PERIOD],
-        ["防守过滤", "RSI条件", f"RSI{RSI_PERIOD}>50"],
+        ["防守过滤", "RSI条件", f"RSI{RSI_PERIOD}>{RSI_NEUTRAL_LEVEL:g}"],
         ["防守过滤", "BIAS周期（绑定趋势窗口）", BIAS_PERIOD],
-        ["防守过滤", "BIAS条件", f"BIAS{BIAS_PERIOD}>0"],
+        ["防守过滤", "BIAS条件", f"BIAS{BIAS_PERIOD}>{BIAS_NEUTRAL_LEVEL:g}"],
         ["趋势过滤", "未通过处理", "不向后补选，空缺权重留现金"],
         ["ETF选择", "代表ETF选择", "跟踪同一指数中当日成交量最大"],
         ["账户结构", "调仓模式", REBALANCE_MODE],
@@ -2819,6 +2824,7 @@ def main() -> None:
             / score_method
             / STRATEGY_VARIANT_DIR
             / ACCOUNT_VARIANT_DIR
+            / DEFENSE_VARIANT_DIR
         )
         print(f"\n开始回测：{score_label}（{score_column}）", flush=True)
 
