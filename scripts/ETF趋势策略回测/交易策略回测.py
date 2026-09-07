@@ -4,16 +4,16 @@
 ETF趋势轮动策略回测。
 
 策略：
-1. 分别按两种趋势得分降序选择前10%的代表指数；
-2. 排名后仅保留当前趋势窗口收益率大于0、RSI大于50且乖离率大于0的指数，
-   RSI周期与单账户调仓间隔绑定，乖离率周期与趋势窗口绑定，不向后补选；
-3. 对每个保留指数，在当日所有跟踪该指数且成交量大于0的ETF中，
-   选择成交量最大者；成交量相同时依次比较成交额、规模和ETF代码；
-4. 单个指数权重按过滤前计划入选数量等权，空缺权重保留为现金；
-5. 分别按信号日收盘价和下一交易日VWAP成交；
-6. 支持两种调仓模式：固定x日全组合调仓，或将资金分成x个独立账户，
-   每天轮换一个账户、每个账户持有x个交易日；
-7. 买入和卖出均收取0.1%的单边交易成本。
+1. 每日分别按两种趋势得分取全池前10%，再检查正收益、RSI、BIAS，不向后补选；
+2. ETF映射沿用同指数信号日成交量最大者，成交额、规模和代码用于并列排序；
+3. 单账户按买入批次独立记账，买入日为第0日，最短持有期按交易日计算；
+4. 每日收盘逐批次检查固定跌幅止损及浮盈回撤退出；风控优先，未到期批次不因排名变化卖出；
+5. 到期且未入选的批次正常卖出；未卖出的批次数量、买入价和计时保持不变；
+6. 卖出释放资金与现金在本轮过滤后的ETF间等额投入，每次追加买入另建批次；
+   同轮风控退出ETF禁止买回，无合格标的时留现金，组合不每日重新等权；
+7. 主口径为信号日收盘决策、次日VWAP成交；close仅保留为同收盘理想化对照；
+8. 买卖各收0.1%费用；无成交价格或成交额时不虚构成交，未成交卖单后续重试。
+   收盘价与VWAP沿用下载数据的统一前复权口径，不在回测中额外调整。
 
 输入：
 - outputs/etf_trend_strategy/threshold_<阈值>/factors/window_<窗口>/YYYY.csv
@@ -22,10 +22,12 @@ ETF趋势轮动策略回测。
 - outputs/benchmark_data/*.csv（按BENCHMARK_CODE选择）
 
 输出：
-- 固定x日：post_rank_positive_return_rsi_bias_filter/rebalance_<x>d/<成交方式>/
-- x账户错峰：post_rank_positive_return_rsi_bias_filter/staggered_<x>d/<成交方式>/
-  每个交易模式独立输出年度指标、总回测指标、合并持仓、时序和账户明细五个Excel，
-  以及累计净值、累计超额、换手率、累计交易成本和策略容量五张图。
+- <公式>/daily_rotation/top_<比例>pct__r_gt_<门槛>/
+  min_hold_<H>d__fixed_stop_<S>pct__profit_trigger_<P>pct__peak_drawdown_<D>pct/
+  <RSI与BIAS条件>/<成交方式>/
+- 文件前缀包含最短持有期、固定止损、浮盈启动和最高点回撤参数；每种成交方式独立输出
+  年度指标、总指标、合并持仓、时序、批次明细五个Excel及原有五张图。
+- batch_details.xlsx包含账户每日状态、批次持仓、批次交易；批次编号贯穿买入和卖出。
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ import csv
 import math
 import statistics
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -58,24 +60,23 @@ BENCHMARK_CODE = "000510.CSI"
 # 默认一次运行两种得分。若以后只想跑其中一种，可只保留对应英文键。
 SCORE_METHODS_TO_RUN = ("return_r2", "return_vol")
 TOP_PERCENT = 0.10
-# "rebalance"：全组合每x个交易日调仓；"staggered"：x个账户逐日错峰持有x日。
-REBALANCE_MODE = "staggered"
-ACCOUNT_REBALANCE_INTERVAL = 7
-ACCOUNT_COUNT = (
-    1 if REBALANCE_MODE == "rebalance" else ACCOUNT_REBALANCE_INTERVAL
-)
-RSI_PERIOD = ACCOUNT_REBALANCE_INTERVAL
+# H和S相互独立，RSI周期也不再与交易频率或最短持有期绑定。
+MIN_HOLD_DAYS = 7
+STOP_LOSS_PCT = 0.05
+PROFIT_TRAILING_TRIGGER_PCT = 0.10
+PROFIT_TRAILING_DRAWDOWN_PCT = 0.05
+ACCOUNT_COUNT = 1
+RSI_PERIOD = 7
 BIAS_PERIOD = TREND_WINDOW
-RSI_NEUTRAL_LEVEL = 60.0
+RSI_NEUTRAL_LEVEL = 60
 BIAS_NEUTRAL_LEVEL = -0.02
 MIN_WINDOW_RETURN = 0.0
-STRATEGY_VARIANT_DIR = "post_rank_positive_return_rsi_bias_filter"
+STRATEGY_VARIANT_DIR = "daily_rotation"
+SELECTION_VARIANT_DIR = f"top_{TOP_PERCENT * 100:g}pct__r_gt_{MIN_WINDOW_RETURN:g}"
 ACCOUNT_VARIANT_DIR = (
-    f"rebalance_{ACCOUNT_REBALANCE_INTERVAL}d"
-    if REBALANCE_MODE == "rebalance"
-    else (
-        f"staggered_{ACCOUNT_REBALANCE_INTERVAL}d"
-    )
+    f"min_hold_{MIN_HOLD_DAYS}d__fixed_stop_{STOP_LOSS_PCT * 100:g}pct"
+    f"__profit_trigger_{PROFIT_TRAILING_TRIGGER_PCT * 100:g}pct"
+    f"__peak_drawdown_{PROFIT_TRAILING_DRAWDOWN_PCT * 100:g}pct"
 )
 INDICATOR_VARIANT_DIR = (
     f"rsi_{RSI_PERIOD}_gt_{RSI_NEUTRAL_LEVEL:g}"
@@ -231,17 +232,18 @@ class Position:
     factor_rank: int
     selection_volume: float
     target_weight: float
-
-
-@dataclass
-class AccountState:
-    account_id: int
-    positions: dict[str, Position]
-    cash: float
-    has_been_built: bool = False
-    last_signal_date: date | None = None
-    last_rebalance_date: date | None = None
-    next_rebalance_date: date | None = None
+    etf_code: str
+    batch_id: int
+    buy_date: date
+    buy_price: float
+    buy_date_position: int
+    highest_close: float
+    pending_exit_reason: str = ""
+    exit_signal_date: date | None = None
+    exit_signal_price: float | None = None
+    exit_signal_age: int = 0
+    exit_signal_peak_price: float | None = None
+    exit_risk_price: float | None = None
 
 
 @dataclass(frozen=True)
@@ -284,6 +286,17 @@ class AccountHoldingRecord:
     market_value: float
     account_weight: float
     total_portfolio_weight: float
+    batch_id: int
+    buy_date: date
+    buy_price: float
+    shares: float
+    holding_days: int
+    stop_price: float
+    highest_close: float
+    max_return: float
+    trailing_active: bool
+    trailing_stop_price: float | None
+    pending_exit_reason: str
 
 
 @dataclass(frozen=True)
@@ -298,6 +311,16 @@ class AccountTradeRecord:
     target_value: float
     trade_amount: float
     transaction_cost: float
+    batch_id: int
+    buy_date: date
+    buy_price: float
+    shares: float
+    execution_price: float
+    reason: str
+    signal_price: float | None
+    signal_holding_days: int
+    signal_peak_price: float | None
+    risk_exit_price: float | None
 
 
 @dataclass(frozen=True)
@@ -356,11 +379,22 @@ class TradeDetail:
     target_value: float
     trade_amount: float
     transaction_cost: float
+    batch_id: int
+    buy_date: date
+    buy_price: float
+    shares: float
+    execution_price: float
+    reason: str
+    signal_price: float | None
+    signal_holding_days: int
+    signal_date: date | None
+    signal_peak_price: float | None
+    risk_exit_price: float | None
 
 
 @dataclass(frozen=True)
 class RebalanceResult:
-    positions: dict[str, Position]
+    positions: dict[int, Position]
     cash: float
     pre_trade_nav: float
     buy_amount: float
@@ -685,28 +719,30 @@ def validate_parameters() -> None:
         raise ValueError("SCORE_METHODS_TO_RUN不能包含重复得分方法")
     if not 0 < TOP_PERCENT <= 1:
         raise ValueError("TOP_PERCENT必须在0到1之间")
-    if REBALANCE_MODE not in {"rebalance", "staggered"}:
-        raise ValueError("REBALANCE_MODE只能设为rebalance或staggered")
-    if not isinstance(ACCOUNT_COUNT, int) or ACCOUNT_COUNT <= 0:
-        raise ValueError("ACCOUNT_COUNT必须是正整数")
+    if type(MIN_HOLD_DAYS) is not int or MIN_HOLD_DAYS < 1:
+        raise ValueError("MIN_HOLD_DAYS必须是正整数，买入日记为第0日")
+    if not math.isfinite(STOP_LOSS_PCT) or not 0 < STOP_LOSS_PCT < 1:
+        raise ValueError("STOP_LOSS_PCT必须在0与1之间，例如0.05表示5%")
     if (
-        not isinstance(ACCOUNT_REBALANCE_INTERVAL, int)
-        or ACCOUNT_REBALANCE_INTERVAL <= 0
+        not math.isfinite(PROFIT_TRAILING_TRIGGER_PCT)
+        or not 0 < PROFIT_TRAILING_TRIGGER_PCT < 1
     ):
-        raise ValueError("ACCOUNT_REBALANCE_INTERVAL必须是正整数")
-    if RSI_PERIOD < 2:
-        raise ValueError("由单账户调仓间隔绑定的RSI周期必须至少为2")
-    expected_account_count = (
-        1 if REBALANCE_MODE == "rebalance" else ACCOUNT_REBALANCE_INTERVAL
-    )
-    if ACCOUNT_COUNT != expected_account_count:
         raise ValueError(
-            "ACCOUNT_COUNT与REBALANCE_MODE、ACCOUNT_REBALANCE_INTERVAL不一致"
+            "PROFIT_TRAILING_TRIGGER_PCT必须在0与1之间，例如0.08表示浮盈8%后启用"
         )
+    if (
+        not math.isfinite(PROFIT_TRAILING_DRAWDOWN_PCT)
+        or not 0 < PROFIT_TRAILING_DRAWDOWN_PCT < 1
+    ):
+        raise ValueError(
+            "PROFIT_TRAILING_DRAWDOWN_PCT必须在0与1之间，例如0.06表示从最高收盘价回撤6%"
+        )
+    if type(RSI_PERIOD) is not int or RSI_PERIOD < 2:
+        raise ValueError("RSI_PERIOD必须是至少2的整数，与最短持有期独立")
     if not math.isfinite(MIN_WINDOW_RETURN):
         raise ValueError("MIN_WINDOW_RETURN必须是有限数值")
-    if TRANSACTION_COST_RATE < 0:
-        raise ValueError("TRANSACTION_COST_RATE不能为负数")
+    if not math.isfinite(TRANSACTION_COST_RATE) or not 0 <= TRANSACTION_COST_RATE < 1:
+        raise ValueError("TRANSACTION_COST_RATE必须在[0, 1)内")
     if not 0 < CAPACITY_DAILY_AMOUNT_RATIO <= 1:
         raise ValueError("CAPACITY_DAILY_AMOUNT_RATIO必须在0到1之间")
     if not 0 <= CAPACITY_DESCENDING_QUANTILE <= 1:
@@ -866,7 +902,6 @@ def build_daily_targets(
 
     targets: dict[date, DailyTarget] = {}
     for signal_date, selection in sorted(daily_selections.items()):
-        target_weight = 1.0 / selection.planned_index_count
         mapped: list[TargetMember] = []
         for member in selection.members:
             candidate = best_by_date_index.get((signal_date, member.index_code))
@@ -879,7 +914,7 @@ def build_daily_targets(
                     index_name=member.index_name or candidate.index_name,
                     etf_code=candidate.code,
                     etf_name=candidate.name,
-                    target_weight=target_weight,
+                    target_weight=0.0,
                     trend_factor=member.trend_factor,
                     factor_rank=member.factor_rank,
                     selection_volume=candidate.volume,
@@ -887,6 +922,8 @@ def build_daily_targets(
                     selection_scale=candidate.scale,
                 )
             )
+        # 此权重仅描述当日新资金内部的等权，不是整个组合的目标权重。
+        mapped = [replace(member, target_weight=1.0 / len(mapped)) for member in mapped]
         targets[signal_date] = DailyTarget(
             signal_date=signal_date,
             planned_index_count=selection.planned_index_count,
@@ -952,158 +989,154 @@ def linear_quantile(values: Sequence[float], quantile: float) -> float | None:
     )
 
 
-def aggregate_target_weights(
-    target: DailyTarget,
-    execution_prices: Mapping[str, float],
-    close_prices: Mapping[str, float],
-) -> tuple[dict[str, float], dict[str, TargetMember]]:
-    """仅保留当日同时有成交价和收盘估值价的目标ETF，其余权重留作现金。"""
-
-    weights: dict[str, float] = defaultdict(float)
-    metadata: dict[str, TargetMember] = {}
-    for member in target.members:
-        if member.etf_code not in execution_prices or member.etf_code not in close_prices:
-            continue
-        weights[member.etf_code] += member.target_weight
-        metadata.setdefault(member.etf_code, member)
-    return dict(weights), metadata
-
-
-def rebalance_portfolio(
-    positions: dict[str, Position],
+def trade_batches(
+    positions: dict[int, Position],
     cash: float,
-    target_weights: Mapping[str, float],
-    target_metadata: Mapping[str, TargetMember],
+    target: DailyTarget | None,
+    signal_date: date,
+    signal_position: int,
+    execution_date: date,
+    execution_position: int,
+    signal_prices: Mapping[str, PricePoint],
     execution_prices: Mapping[str, float],
-) -> RebalanceResult:
-    """按给定成交价格调仓，并完整返回实际买卖额和成本。"""
+    next_batch_id: int,
+) -> tuple[RebalanceResult, int, bool]:
+    """先逐批次卖出，再仅将现金等额投入本轮信号名单；旧批次不调权。"""
+    selected = {member.etf_code: member for member in target.members} if target else {}
+    blocked_codes: set[str] = set()
+    survivors: dict[int, Position] = {}
+    details: list[TradeDetail] = []
+    skipped: list[str] = []
+    buy_amount = sell_amount = fee = 0.0
+    attempted = False
 
-    missing_held_prices = sorted(set(positions) - set(execution_prices))
-    if missing_held_prices:
-        # 旧持仓缺少当日成交价时不能可靠卖出，因此整次调仓跳过。
-        return RebalanceResult(
-            positions=positions,
-            cash=cash,
-            pre_trade_nav=0.0,
-            buy_amount=0.0,
-            sell_amount=0.0,
-            transaction_cost=0.0,
-            trade_details=(),
-            succeeded=False,
-            skip_reason="旧持仓缺少当日成交价：" + ",".join(missing_held_prices),
+    for batch_id, position in positions.items():
+        point = signal_prices.get(position.etf_code)
+        signal_close = point.close if point else None
+        age = signal_position - position.buy_date_position
+        reason = position.pending_exit_reason
+        fixed_stop_price = position.buy_price * (1.0 - STOP_LOSS_PCT)
+        if signal_close is not None:
+            position.highest_close = max(position.highest_close, signal_close)
+        trailing_active = (
+            position.highest_close
+            >= position.buy_price * (1.0 + PROFIT_TRAILING_TRIGGER_PCT)
         )
-
-    current_values = {
-        code: position.shares * execution_prices[code]
-        for code, position in positions.items()
-    }
-    nav_before_cost = cash + sum(current_values.values())
-    if nav_before_cost <= 0:
-        raise RuntimeError("调仓前组合净值不大于0")
-
-    fee = 0.0
-    buy_amount = 0.0
-    sell_amount = 0.0
-    desired_values: dict[str, float] = {}
-    for _ in range(100):
-        investable_nav = max(0.0, nav_before_cost - fee)
-        desired_values = {
-            code: weight * investable_nav
-            for code, weight in target_weights.items()
-            if weight > 0
-        }
-        all_codes = set(current_values).union(desired_values)
-        buy_amount = sum(
-            max(desired_values.get(code, 0.0) - current_values.get(code, 0.0), 0.0)
-            for code in all_codes
+        trailing_stop_price = (
+            position.highest_close * (1.0 - PROFIT_TRAILING_DRAWDOWN_PCT)
+            if trailing_active
+            else None
         )
-        sell_amount = sum(
-            max(current_values.get(code, 0.0) - desired_values.get(code, 0.0), 0.0)
-            for code in all_codes
+        fixed_stop_triggered = (
+            signal_close is not None and signal_close <= fixed_stop_price
         )
-        new_fee = TRANSACTION_COST_RATE * (buy_amount + sell_amount)
-        if math.isclose(new_fee, fee, rel_tol=1e-13, abs_tol=1e-15):
-            fee = new_fee
-            break
-        fee = new_fee
-    else:
-        raise RuntimeError("交易成本迭代未收敛")
+        trailing_stop_triggered = (
+            signal_close is not None
+            and trailing_stop_price is not None
+            and signal_close <= trailing_stop_price
+        )
+        risk_reason = (
+            "固定止损" if fixed_stop_triggered
+            else "浮盈回撤" if trailing_stop_triggered
+            else ""
+        )
+        if risk_reason and reason != "固定止损":
+            # 未成交的普通卖单或浮盈回撤卖单如再触发更高优先级风控，升级原因。
+            if reason != risk_reason:
+                position.pending_exit_reason = reason = risk_reason
+                position.exit_signal_date = signal_date
+                position.exit_signal_price = signal_close
+                position.exit_signal_age = age
+                position.exit_signal_peak_price = position.highest_close
+                position.exit_risk_price = (
+                    fixed_stop_price
+                    if risk_reason == "固定止损"
+                    else trailing_stop_price
+                )
+        elif not reason and target is not None and age >= MIN_HOLD_DAYS and position.etf_code not in selected:
+            position.pending_exit_reason = reason = "到期未入选"
+            position.exit_signal_date = signal_date
+            position.exit_signal_price = signal_close
+            position.exit_signal_age = age
+            position.exit_signal_peak_price = position.highest_close
+            position.exit_risk_price = None
 
-    new_positions: dict[str, Position] = {}
-    for code, desired_value in desired_values.items():
-        if desired_value <= 1e-15:
+        if reason in {"固定止损", "浮盈回撤"}:
+            blocked_codes.add(position.etf_code)
+        if not reason:
+            survivors[batch_id] = position
             continue
-        member = target_metadata[code]
-        new_positions[code] = Position(
-            shares=desired_value / execution_prices[code],
-            index_code=member.index_code,
-            index_name=member.index_name,
-            etf_name=member.etf_name,
-            signal_date=member.signal_date,
-            trend_factor=member.trend_factor,
-            factor_rank=member.factor_rank,
-            selection_volume=member.selection_volume,
-            target_weight=target_weights[code],
-        )
-
-    post_cost_nav = nav_before_cost - fee
-    new_cash = post_cost_nav - sum(desired_values.values())
-    if new_cash < 0 and abs(new_cash) <= 1e-12:
-        new_cash = 0.0
-    if new_cash < 0:
-        raise RuntimeError(f"调仓后现金为负：{new_cash}")
-
-    trade_details: list[TradeDetail] = []
-    for code in sorted(set(current_values).union(desired_values)):
-        before_value = current_values.get(code, 0.0)
-        target_value = desired_values.get(code, 0.0)
-        difference = target_value - before_value
-        if abs(difference) <= 1e-15:
+        attempted = True
+        price = execution_prices.get(position.etf_code)
+        if price is None:
+            # 卖单保留到后续交易日；不得把未成交卖单当成可用现金。
+            survivors[batch_id] = position
+            skipped.append(f"批次{batch_id}/{position.etf_code}卖出缺少成交价")
             continue
-        target_member = target_metadata.get(code)
-        old_position = positions.get(code)
-        etf_name = (
-            target_member.etf_name
-            if target_member is not None
-            else old_position.etf_name if old_position is not None else ""
-        )
-        trade_details.append(
-            TradeDetail(
-                etf_code=code,
-                etf_name=etf_name,
-                direction="买入" if difference > 0 else "卖出",
-                before_value=before_value,
-                target_value=target_value,
-                trade_amount=abs(difference),
-                transaction_cost=TRANSACTION_COST_RATE * abs(difference),
+        value = position.shares * price
+        cost = value * TRANSACTION_COST_RATE
+        cash += value - cost
+        sell_amount += value
+        fee += cost
+        details.append(TradeDetail(
+            etf_code=position.etf_code, etf_name=position.etf_name,
+            direction="卖出", before_value=value, target_value=0.0,
+            trade_amount=value, transaction_cost=cost, batch_id=batch_id,
+            buy_date=position.buy_date, buy_price=position.buy_price,
+            shares=position.shares, execution_price=price, reason=reason,
+            signal_date=position.exit_signal_date,
+            signal_price=position.exit_signal_price,
+            signal_holding_days=position.exit_signal_age,
+            signal_peak_price=position.exit_signal_peak_price,
+            risk_exit_price=position.exit_risk_price,
+        ))
+
+    candidates = [member for code, member in selected.items() if code not in blocked_codes]
+    if candidates and cash > 1e-15:
+        attempted = True
+        # 在看到执行价格前固定等额预算。某只无法成交，其预算留现金，不事后补选。
+        budget = cash / len(candidates)
+        allocation_weight = 1.0 / len(candidates)
+        for member in candidates:
+            price = execution_prices.get(member.etf_code)
+            if price is None:
+                skipped.append(f"{member.etf_code}买入缺少成交价")
+                continue
+            value = budget / (1.0 + TRANSACTION_COST_RATE)
+            cost = value * TRANSACTION_COST_RATE
+            batch_id = next_batch_id
+            next_batch_id += 1
+            position = Position(
+                shares=value / price, index_code=member.index_code,
+                index_name=member.index_name, etf_name=member.etf_name,
+                signal_date=signal_date, trend_factor=member.trend_factor,
+                factor_rank=member.factor_rank, selection_volume=member.selection_volume,
+                target_weight=allocation_weight, etf_code=member.etf_code,
+                batch_id=batch_id, buy_date=execution_date, buy_price=price,
+                buy_date_position=execution_position, highest_close=price,
             )
-        )
+            survivors[batch_id] = position
+            cash -= value + cost
+            buy_amount += value
+            fee += cost
+            point = signal_prices.get(member.etf_code)
+            details.append(TradeDetail(
+                etf_code=member.etf_code, etf_name=member.etf_name,
+                direction="买入", before_value=0.0, target_value=value,
+                trade_amount=value, transaction_cost=cost, batch_id=batch_id,
+                buy_date=execution_date, buy_price=price, shares=position.shares,
+                execution_price=price, reason="可用现金等额买入", signal_date=signal_date,
+                signal_price=point.close if point else None, signal_holding_days=0,
+                signal_peak_price=None, risk_exit_price=None,
+            ))
+    if cash < -1e-12:
+        raise RuntimeError(f"交易后现金为负：{cash}")
     return RebalanceResult(
-        positions=new_positions,
-        cash=new_cash,
-        pre_trade_nav=nav_before_cost,
-        buy_amount=buy_amount,
-        sell_amount=sell_amount,
-        transaction_cost=fee,
-        trade_details=tuple(trade_details),
-        succeeded=True,
-        skip_reason="",
-    )
-
-
-def portfolio_value_at_close(
-    positions: Mapping[str, Position],
-    cash: float,
-    close_prices: Mapping[str, float],
-    last_closes: Mapping[str, float],
-) -> float:
-    value = cash
-    for code, position in positions.items():
-        close = close_prices.get(code, last_closes.get(code))
-        if close is None:
-            raise RuntimeError(f"持仓ETF缺少可用收盘价：{code}")
-        value += position.shares * close
-    return value
+        positions=survivors, cash=max(cash, 0.0), pre_trade_nav=0.0,
+        buy_amount=buy_amount, sell_amount=sell_amount, transaction_cost=fee,
+        trade_details=tuple(details), succeeded=attempted and not skipped,
+        skip_reason="；".join(skipped),
+    ), next_batch_id, attempted
 
 
 def run_backtest(
@@ -1112,311 +1145,163 @@ def run_backtest(
     targets: Mapping[date, DailyTarget],
     prices: Mapping[date, Mapping[str, PricePoint]],
 ) -> tuple[
-    list[HoldingRecord],
-    list[NavRecord],
-    list[AccountDailyRecord],
-    list[AccountHoldingRecord],
-    list[AccountTradeRecord],
+    list[HoldingRecord], list[NavRecord], list[AccountDailyRecord],
+    list[AccountHoldingRecord], list[AccountTradeRecord],
 ]:
     if mode not in {"close", "next_day_vwap"}:
         raise ValueError(f"未知回测模式：{mode}")
-    if not trading_dates:
-        raise ValueError("没有可用交易日期")
-
-    accounts = [
-        AccountState(
-            account_id=account_index + 1,
-            positions={},
-            cash=INITIAL_NAV / ACCOUNT_COUNT,
-        )
-        for account_index in range(ACCOUNT_COUNT)
-    ]
-    for account_index, account in enumerate(accounts):
-        first_position = account_index if mode == "close" else account_index + 1
-        account.next_rebalance_date = (
-            trading_dates[first_position]
-            if first_position < len(trading_dates)
-            else None
-        )
-
+    if not trading_dates or list(trading_dates) != sorted(set(trading_dates)):
+        raise ValueError("交易日历必须非空、严格递增且无重复")
+    positions: dict[int, Position] = {}
+    cash = INITIAL_NAV
+    next_batch_id = 1
     last_closes: dict[str, float] = {}
-    previous_nav = INITIAL_NAV
-    running_peak = INITIAL_NAV
+    previous_nav = running_peak = INITIAL_NAV
     cumulative_cost_rate = 0.0
+    has_been_built = False
+    last_trade_date: date | None = None
     holdings: list[HoldingRecord] = []
     nav_records: list[NavRecord] = []
-    account_daily_records: list[AccountDailyRecord] = []
-    account_holding_records: list[AccountHoldingRecord] = []
-    account_trade_records: list[AccountTradeRecord] = []
+    daily_records: list[AccountDailyRecord] = []
+    batch_records: list[AccountHoldingRecord] = []
+    trade_records: list[AccountTradeRecord] = []
 
     for date_position, current_date in enumerate(trading_dates):
         daily_prices = prices.get(current_date, {})
-        close_prices = {
-            code: point.close
-            for code, point in daily_prices.items()
-            if point.close is not None
+        close_prices = {code: p.close for code, p in daily_prices.items() if p.close is not None}
+        execution_prices = {
+            code: price for code, point in daily_prices.items()
+            if (price := (point.close if mode == "close" else point.vwap)) is not None
+            and point.amount is not None and point.amount > 0
         }
-        vwap_prices = {
-            code: point.vwap
-            for code, point in daily_prices.items()
-            if point.vwap is not None
-        }
+        # close保留为原脚本的同收盘理想化对照；主口径始终用前一日信号、次日VWAP。
+        signal_position = date_position if mode == "close" else date_position - 1
+        signal_date = trading_dates[signal_position] if signal_position >= 0 else None
+        target = targets.get(signal_date) if signal_date is not None else None
+        attempted = succeeded = initial_build = False
+        buy_amount = sell_amount = transaction_cost = 0.0
+        skip_reason = ""
+        missing_price_count = 0
+        if signal_date is not None:
+            result, next_batch_id, attempted = trade_batches(
+                positions, cash, target, signal_date, signal_position,
+                current_date, date_position, prices.get(signal_date, {}),
+                execution_prices, next_batch_id,
+            )
+            positions, cash = result.positions, result.cash
+            buy_amount, sell_amount = result.buy_amount, result.sell_amount
+            transaction_cost = result.transaction_cost
+            succeeded, skip_reason = result.succeeded, result.skip_reason
+            if target is None:
+                skip_reason = "缺少当日因子信号，仅处理风控退出及未成交卖单" + ("；" + skip_reason if skip_reason else "")
+            if target:
+                missing_price_count = sum(m.etf_code not in execution_prices for m in target.members)
+            initial_build = not has_been_built and buy_amount > 0
+            has_been_built = has_been_built or initial_build
+            if result.trade_details:
+                last_trade_date = current_date
+            for detail in result.trade_details:
+                trade_records.append(AccountTradeRecord(
+                    execution_date=current_date, account_id=1,
+                    signal_date=detail.signal_date, etf_code=detail.etf_code,
+                    etf_name=detail.etf_name, direction=detail.direction,
+                    before_value=detail.before_value, target_value=detail.target_value,
+                    trade_amount=detail.trade_amount, transaction_cost=detail.transaction_cost,
+                    batch_id=detail.batch_id, buy_date=detail.buy_date,
+                    buy_price=detail.buy_price, shares=detail.shares,
+                    execution_price=detail.execution_price, reason=detail.reason,
+                    signal_price=detail.signal_price,
+                    signal_holding_days=detail.signal_holding_days,
+                    signal_peak_price=detail.signal_peak_price,
+                    risk_exit_price=detail.risk_exit_price,
+                ))
+
         last_closes.update(close_prices)
-
-        execution_prices: Mapping[str, float] = (
-            close_prices if mode == "close" else vwap_prices
-        )
-        scheduled_accounts = [
-            account
-            for account in accounts
-            if account.next_rebalance_date == current_date
-        ]
-        if len(scheduled_accounts) > 1:
-            raise RuntimeError(f"{current_date}存在多个计划调仓账户")
-        rebalance_account = scheduled_accounts[0] if scheduled_accounts else None
-        rebalance_attempted = rebalance_account is not None
-        execution_target: DailyTarget | None = None
-        signal_date: date | None = None
-        rebalance_result: RebalanceResult | None = None
-        missing_price_index_count = 0
-        initial_build = False
-
-        if rebalance_attempted:
-            if rebalance_account is None:
-                raise RuntimeError("计划调仓账户为空")
-            signal_date = (
-                current_date
-                if mode == "close"
-                else trading_dates[date_position - 1]
-            )
-            execution_target = targets.get(signal_date)
-
-            if execution_target is None:
-                target_weights: dict[str, float] = {}
-                target_metadata: dict[str, TargetMember] = {}
-            else:
-                target_weights, target_metadata = aggregate_target_weights(
-                    execution_target,
-                    execution_prices,
-                    close_prices,
-                )
-                missing_price_index_count = sum(
-                    member.etf_code not in execution_prices
-                    or member.etf_code not in close_prices
-                    for member in execution_target.members
-                )
-
-            rebalance_result = rebalance_portfolio(
-                rebalance_account.positions,
-                rebalance_account.cash,
-                target_weights,
-                target_metadata,
-                execution_prices,
-            )
-            rebalance_account.positions = rebalance_result.positions
-            rebalance_account.cash = rebalance_result.cash
-            next_position = date_position + ACCOUNT_REBALANCE_INTERVAL
-            rebalance_account.next_rebalance_date = (
-                trading_dates[next_position]
-                if next_position < len(trading_dates)
-                else None
-            )
-
-            if rebalance_result.succeeded:
-                initial_build = (
-                    not rebalance_account.has_been_built
-                    and rebalance_result.buy_amount > 0
-                )
-                if initial_build:
-                    rebalance_account.has_been_built = True
-                rebalance_account.last_signal_date = signal_date
-                rebalance_account.last_rebalance_date = current_date
-                for detail in rebalance_result.trade_details:
-                    account_trade_records.append(
-                        AccountTradeRecord(
-                            execution_date=current_date,
-                            account_id=rebalance_account.account_id,
-                            signal_date=signal_date,
-                            etf_code=detail.etf_code,
-                            etf_name=detail.etf_name,
-                            direction=detail.direction,
-                            before_value=detail.before_value,
-                            target_value=detail.target_value,
-                            trade_amount=detail.trade_amount,
-                            transaction_cost=detail.transaction_cost,
-                        )
-                    )
-
-        buy_amount = rebalance_result.buy_amount if rebalance_result else 0.0
-        sell_amount = rebalance_result.sell_amount if rebalance_result else 0.0
-        transaction_cost = (
-            rebalance_result.transaction_cost if rebalance_result else 0.0
-        )
-        pre_trade_nav = previous_nav
-        buy_ratio = buy_amount / pre_trade_nav if pre_trade_nav > 0 else 0.0
-        sell_ratio = sell_amount / pre_trade_nav if pre_trade_nav > 0 else 0.0
-        bilateral_ratio = buy_ratio + sell_ratio
-        one_way_turnover = bilateral_ratio / 2.0
-        transaction_cost_rate = (
-            transaction_cost / pre_trade_nav if pre_trade_nav > 0 else 0.0
-        )
-        cumulative_cost_rate = 1.0 - (
-            (1.0 - cumulative_cost_rate) * (1.0 - transaction_cost_rate)
-        )
-
-        account_navs: dict[int, float] = {}
-        account_market_values: dict[int, float] = {}
-        combined_market_values: dict[str, float] = defaultdict(float)
+        combined_values: dict[str, float] = defaultdict(float)
         combined_positions: dict[str, Position] = {}
-        for account in accounts:
-            account_market_value = 0.0
-            for code, position in account.positions.items():
-                close = close_prices.get(code, last_closes.get(code))
-                if close is None:
-                    raise RuntimeError(f"持仓ETF缺少可用收盘价：{code}")
-                market_value = position.shares * close
-                account_market_value += market_value
-                combined_market_values[code] += market_value
-                existing = combined_positions.get(code)
-                if existing is None or position.signal_date > existing.signal_date:
-                    combined_positions[code] = position
-            account_market_values[account.account_id] = account_market_value
-            account_navs[account.account_id] = account.cash + account_market_value
-
-        nav = sum(account_navs.values())
-        total_cash = sum(account.cash for account in accounts)
+        batch_values: dict[int, float] = {}
+        for batch_id, position in positions.items():
+            # 当日缺失收盘价时沿用最近收盘；新买入且无历史估值时用实际成交价。
+            close = last_closes.get(position.etf_code, position.buy_price)
+            current_close = close_prices.get(position.etf_code)
+            if current_close is not None:
+                position.highest_close = max(position.highest_close, current_close)
+            value = position.shares * close
+            batch_values[batch_id] = value
+            combined_values[position.etf_code] += value
+            combined_positions[position.etf_code] = position
+        etf_value = sum(combined_values.values())
+        nav = cash + etf_value
         daily_return = nav / previous_nav - 1.0
-        gross_return = daily_return + transaction_cost / previous_nav
+        cost_rate = transaction_cost / previous_nav
+        cumulative_cost_rate = 1.0 - (1.0 - cumulative_cost_rate) * (1.0 - cost_rate)
         running_peak = max(running_peak, nav)
-        drawdown = 1.0 - nav / running_peak
-        cash_weight = total_cash / nav if nav > 0 else 0.0
-
-        capacity_samples: list[float] = []
-        for code, market_value in combined_market_values.items():
-            amount = daily_prices.get(code).amount if code in daily_prices else None
-            actual_weight = market_value / nav if nav > 0 else 0.0
-            if amount is None or actual_weight <= 1e-6:
-                continue
-            capacity_samples.append(
-                CAPACITY_DAILY_AMOUNT_RATIO * amount / actual_weight
+        capacity_samples = []
+        for code, value in combined_values.items():
+            point = daily_prices.get(code)
+            weight = value / nav
+            if point and point.amount and weight > 1e-6:
+                capacity_samples.append(CAPACITY_DAILY_AMOUNT_RATIO * point.amount / weight)
+        capacity = linear_quantile(capacity_samples, 1.0 - CAPACITY_DESCENDING_QUANTILE)
+        nav_records.append(NavRecord(
+            current_date=current_date, signal_date=signal_date,
+            pre_trade_nav=previous_nav, nav=nav,
+            gross_return=daily_return + cost_rate, daily_return=daily_return,
+            drawdown=1.0 - nav / running_peak, buy_ratio=buy_amount / previous_nav,
+            sell_ratio=sell_amount / previous_nav,
+            bilateral_ratio=(buy_amount + sell_amount) / previous_nav,
+            one_way_turnover=(buy_amount + sell_amount) / (2.0 * previous_nav),
+            transaction_cost=transaction_cost, transaction_cost_rate=cost_rate,
+            cumulative_cost_rate=cumulative_cost_rate, capacity=capacity,
+            holding_count=len(combined_values), cash_weight=cash / nav,
+            initial_build=initial_build, rebalance_account_id=1 if attempted else None,
+            rebalance_attempted=attempted, rebalance_succeeded=succeeded,
+            skip_reason=skip_reason,
+            selected_index_count=target.selected_index_count if target else 0,
+            unmapped_index_count=target.unmapped_index_count if target else 0,
+            missing_price_index_count=missing_price_count,
+        ))
+        for code, value in sorted(combined_values.items()):
+            p = combined_positions[code]
+            holdings.append(HoldingRecord(
+                current_date=current_date, signal_date=p.signal_date,
+                index_code=p.index_code, index_name=p.index_name,
+                trend_factor=p.trend_factor, factor_rank=p.factor_rank,
+                etf_code=code, etf_name=p.etf_name, selection_volume=p.selection_volume,
+                target_weight=value / nav, actual_weight=value / nav,
+            ))
+        daily_records.append(AccountDailyRecord(
+            current_date=current_date, account_id=1, account_nav=nav,
+            etf_market_value=etf_value, cash=cash, cash_weight=cash / nav,
+            rebalance_attempted=attempted, rebalance_succeeded=succeeded,
+            signal_date=signal_date, last_rebalance_date=last_trade_date,
+            next_rebalance_date=trading_dates[date_position + 1] if date_position + 1 < len(trading_dates) else None,
+        ))
+        for batch_id, p in sorted(positions.items()):
+            value = batch_values[batch_id]
+            trailing_active = (
+                p.highest_close
+                >= p.buy_price * (1.0 + PROFIT_TRAILING_TRIGGER_PCT)
             )
-        capacity = linear_quantile(
-            capacity_samples,
-            1.0 - CAPACITY_DESCENDING_QUANTILE,
-        )
-
-        nav_records.append(
-            NavRecord(
-                current_date=current_date,
-                signal_date=signal_date,
-                pre_trade_nav=pre_trade_nav,
-                nav=nav,
-                gross_return=gross_return,
-                daily_return=daily_return,
-                drawdown=drawdown,
-                buy_ratio=buy_ratio,
-                sell_ratio=sell_ratio,
-                bilateral_ratio=bilateral_ratio,
-                one_way_turnover=one_way_turnover,
-                transaction_cost=transaction_cost,
-                transaction_cost_rate=transaction_cost_rate,
-                cumulative_cost_rate=cumulative_cost_rate,
-                capacity=capacity,
-                holding_count=len(combined_market_values),
-                cash_weight=cash_weight,
-                initial_build=initial_build,
-                rebalance_account_id=(
-                    rebalance_account.account_id
-                    if rebalance_account is not None
+            batch_records.append(AccountHoldingRecord(
+                current_date=current_date, account_id=1, signal_date=p.signal_date,
+                etf_code=p.etf_code, etf_name=p.etf_name, market_value=value,
+                account_weight=value / nav, total_portfolio_weight=value / nav,
+                batch_id=batch_id, buy_date=p.buy_date, buy_price=p.buy_price,
+                shares=p.shares, holding_days=date_position - p.buy_date_position,
+                stop_price=p.buy_price * (1.0 - STOP_LOSS_PCT),
+                highest_close=p.highest_close,
+                max_return=p.highest_close / p.buy_price - 1.0,
+                trailing_active=trailing_active,
+                trailing_stop_price=(
+                    p.highest_close * (1.0 - PROFIT_TRAILING_DRAWDOWN_PCT)
+                    if trailing_active
                     else None
                 ),
-                rebalance_attempted=rebalance_attempted,
-                rebalance_succeeded=(
-                    rebalance_result.succeeded if rebalance_result else False
-                ),
-                skip_reason=(rebalance_result.skip_reason if rebalance_result else ""),
-                selected_index_count=(
-                    execution_target.selected_index_count if execution_target else 0
-                ),
-                unmapped_index_count=(
-                    execution_target.unmapped_index_count if execution_target else 0
-                ),
-                missing_price_index_count=missing_price_index_count,
-            )
-        )
-
-        for code in sorted(combined_market_values):
-            position = combined_positions[code]
-            actual_weight = combined_market_values[code] / nav if nav > 0 else 0.0
-            holdings.append(
-                HoldingRecord(
-                    current_date=current_date,
-                    signal_date=position.signal_date,
-                    index_code=position.index_code,
-                    index_name=position.index_name,
-                    trend_factor=position.trend_factor,
-                    factor_rank=position.factor_rank,
-                    etf_code=code,
-                    etf_name=position.etf_name,
-                    selection_volume=position.selection_volume,
-                    target_weight=actual_weight,
-                    actual_weight=actual_weight,
-                )
-            )
-
-        for account in accounts:
-            account_nav = account_navs[account.account_id]
-            account_market_value = account_market_values[account.account_id]
-            account_daily_records.append(
-                AccountDailyRecord(
-                    current_date=current_date,
-                    account_id=account.account_id,
-                    account_nav=account_nav,
-                    etf_market_value=account_market_value,
-                    cash=account.cash,
-                    cash_weight=(account.cash / account_nav if account_nav > 0 else 0.0),
-                    rebalance_attempted=(account is rebalance_account),
-                    rebalance_succeeded=(
-                        account is rebalance_account
-                        and rebalance_result is not None
-                        and rebalance_result.succeeded
-                    ),
-                    signal_date=account.last_signal_date,
-                    last_rebalance_date=account.last_rebalance_date,
-                    next_rebalance_date=account.next_rebalance_date,
-                )
-            )
-            for code, position in sorted(account.positions.items()):
-                close = close_prices.get(code, last_closes.get(code))
-                if close is None:
-                    continue
-                market_value = position.shares * close
-                account_holding_records.append(
-                    AccountHoldingRecord(
-                        current_date=current_date,
-                        account_id=account.account_id,
-                        signal_date=position.signal_date,
-                        etf_code=code,
-                        etf_name=position.etf_name,
-                        market_value=market_value,
-                        account_weight=(
-                            market_value / account_nav if account_nav > 0 else 0.0
-                        ),
-                        total_portfolio_weight=(
-                            market_value / nav if nav > 0 else 0.0
-                        ),
-                    )
-                )
-
+                pending_exit_reason=p.pending_exit_reason,
+            ))
         previous_nav = nav
-
-    return (
-        holdings,
-        nav_records,
-        account_daily_records,
-        account_holding_records,
-        account_trade_records,
-    )
+    return holdings, nav_records, daily_records, batch_records, trade_records
 
 
 def calculate_performance(nav_records: Sequence[NavRecord]) -> dict[str, object]:
@@ -1718,7 +1603,7 @@ def build_validation_rows(
     holding_records: Sequence[HoldingRecord],
     nav_records: Sequence[NavRecord],
 ) -> list[dict[str, object]]:
-    label = MODE_LABELS[mode]
+    label = mode_execution_label(mode)
     holdings_by_date: dict[date, float] = defaultdict(float)
     for record in holding_records:
         holdings_by_date[record.current_date] += record.actual_weight
@@ -1822,13 +1707,13 @@ def build_validation_rows(
             "成本率=0.1%×(买入比例+卖出比例)",
         ),
         check_row(
-            "信号日期与成交日期无未来数据",
+            "信号与成交日期符合模式约定",
             signal_errors,
             0,
             float(signal_errors),
             0.0,
             signal_errors == 0,
-            "收盘成交同日；次日VWAP成交必须晚于信号日",
+            "close是同收盘理想化对照；次日VWAP严格使用此前收盘信号",
         ),
         check_row(
             "关键日序列均为有限数值",
@@ -1950,8 +1835,21 @@ def save_workbook_atomic(workbook: Workbook, path: Path) -> Path:
     return path
 
 
+def output_prefix(mode: str) -> str:
+    return (
+        f"daily_hold_{MIN_HOLD_DAYS}d_stop_{STOP_LOSS_PCT * 100:g}pct"
+        f"_profit_{PROFIT_TRAILING_TRIGGER_PCT * 100:g}pct"
+        f"_trail_{PROFIT_TRAILING_DRAWDOWN_PCT * 100:g}pct_{mode}"
+    )
+
+
 def mode_execution_label(mode: str) -> str:
-    return "收盘价" if mode == "close" else "次日VWAP"
+    execution = "同收盘价（理想化对照）" if mode == "close" else "次日VWAP"
+    return (
+        f"{execution}；每日轮动 / 最短{MIN_HOLD_DAYS}日 / 固定止损{STOP_LOSS_PCT:.1%}"
+        f" / 浮盈{PROFIT_TRAILING_TRIGGER_PCT:.1%}后回撤"
+        f"{PROFIT_TRAILING_DRAWDOWN_PCT:.1%}退出"
+    )
 
 
 def write_annual_metrics_workbook(
@@ -2015,7 +1913,7 @@ def write_annual_metrics_workbook(
         sheet.cell(row=row_number, column=turnover_column).number_format = '0.00"倍"'
     return save_workbook_atomic(
         workbook,
-        output_dir / f"{mode}_annual_metrics.xlsx",
+        output_dir / f"{output_prefix(mode)}_annual_metrics.xlsx",
     )
 
 
@@ -2122,19 +2020,6 @@ def write_backtest_metrics_workbook(
     parameter_sheet = workbook.create_sheet("parameters")
     parameter_sheet.append(["类别", "参数 / 约束", "本项目设置"])
     execution_label = mode_execution_label(mode)
-    if REBALANCE_MODE == "rebalance":
-        account_structure_label = (
-            f"单账户每{ACCOUNT_REBALANCE_INTERVAL}个交易日全组合调仓"
-        )
-        planned_rebalance_label = "计划调仓日1个，其他交易日0个"
-        transfer_label = "不适用；单账户"
-    else:
-        account_structure_label = (
-            f"{ACCOUNT_COUNT}个独立账户逐日错峰持有"
-            f"{ACCOUNT_REBALANCE_INTERVAL}个交易日"
-        )
-        planned_rebalance_label = "每个交易日1个"
-        transfer_label = "无；各账户独立复利并保留自己的现金"
     parameter_rows = [
         ["基本信息", "执行价格", execution_label],
         ["基准设置", "基准名称", benchmark.name],
@@ -2145,20 +2030,27 @@ def write_backtest_metrics_workbook(
         ["趋势策略", "排名得分公式", SCORE_LABELS[score_method]],
         ["趋势策略", "调仓日入选比例", TOP_PERCENT],
         ["趋势过滤", "过滤位置", "排名后"],
-        ["趋势过滤", "正收益条件", "当前趋势窗口收益率>0"],
-        ["防守过滤", "RSI周期（绑定调仓间隔）", RSI_PERIOD],
-        ["防守过滤", "RSI条件", f"RSI{RSI_PERIOD}>50"],
-        ["防守过滤", "BIAS周期（绑定趋势窗口）", BIAS_PERIOD],
-        ["防守过滤", "BIAS条件", f"BIAS{BIAS_PERIOD}>0"],
-        ["趋势过滤", "未通过处理", "不向后补选，空缺权重留现金"],
+        ["趋势过滤", "正收益条件", f"当前趋势窗口收益率>{MIN_WINDOW_RETURN:g}"],
+        ["买入过滤", "RSI周期（独立参数）", RSI_PERIOD],
+        ["买入过滤", "RSI条件", f"RSI{RSI_PERIOD}>{RSI_NEUTRAL_LEVEL:g}"],
+        ["买入过滤", "BIAS周期（绑定趋势窗口）", BIAS_PERIOD],
+        ["买入过滤", "BIAS条件", f"BIAS{BIAS_PERIOD}>{BIAS_NEUTRAL_LEVEL:g}"],
+        ["趋势过滤", "未通过处理", "先取全池Top比例再过滤；不补选；新资金在合格ETF中等额投入"],
         ["ETF选择", "代表ETF选择", "跟踪同一指数中当日成交量最大"],
-        ["账户结构", "调仓模式", REBALANCE_MODE],
-        ["账户结构", "组合结构", account_structure_label],
+        ["账户结构", "调仓模式", "单账户每日轮动，独立买入批次"],
         ["账户结构", "账户数量", ACCOUNT_COUNT],
-        ["账户结构", "每账户初始资金比例", 1.0 / ACCOUNT_COUNT],
-        ["账户结构", "计划调仓账户数", planned_rebalance_label],
-        ["账户结构", "单账户调仓间隔（交易日）", ACCOUNT_REBALANCE_INTERVAL],
-        ["账户结构", "账户之间资金转移", transfer_label],
+        ["持有约束", "最短持有期（交易日）", MIN_HOLD_DAYS],
+        ["持有约束", "计时方式", "成交日第0日；同ETF每次买入独立计时，续持不重置"],
+        ["持有约束", "正常退出", "信号日持有天数达到H且不在过滤后名单，整批卖出"],
+        ["止损设置", "固定跌幅止损比例", STOP_LOSS_PCT],
+        ["止损设置", "浮盈回撤启动比例", PROFIT_TRAILING_TRIGGER_PCT],
+        ["止损设置", "最高收盘价回撤比例", PROFIT_TRAILING_DRAWDOWN_PCT],
+        ["止损设置", "固定止损触发", "信号日收盘价<=该批次买入成交价×(1-S)，优先于最短持有期"],
+        ["止损设置", "浮盈回撤触发", "最高收盘浮盈达到启动比例后，信号日收盘价从最高收盘价回撤达到设定比例；优先于最短持有期"],
+        ["止损设置", "重新买入", "同轮风控退出ETF禁买；下一轮重新评估；无额外冷静期"],
+        ["交易设置", "未成交处理", "缺价或无成交额不成交；未成交卖单后续重试；不预支卖出资金"],
+        ["交易设置", "缺失信号", "保留普通持仓，仅处理风控退出和未成交卖单；现金等待有效名单"],
+        ["交易设置", "价格口径", "沿用ETF总表收盘价和VWAP的统一前复权口径"],
         ["交易设置", "初始净值 NAV₀", INITIAL_NAV],
         ["收益参数", "年化无风险利率 r_f", ANNUAL_RISK_FREE_RATE],
         ["交易成本", "买入成本 c_buy", TRANSACTION_COST_RATE],
@@ -2167,7 +2059,9 @@ def write_backtest_metrics_workbook(
         ["容量参数", "当日成交额使用比例 ρ_amt", CAPACITY_DAILY_AMOUNT_RATIO],
         ["容量参数", "倒序分位 q_desc", CAPACITY_DESCENDING_QUANTILE],
         ["容量参数", "等价升序分位 q_asc", 1.0 - CAPACITY_DESCENDING_QUANTILE],
-        ["组合约束", "指数权重", "按过滤前计划入选数量等权"],
+        ["组合约束", "资金分配", "现金与实际卖出净收入合并，仅新投入资金等额分配；旧批次不调权"],
+        ["组合约束", "持仓数量", "不设Top数量上限，未到期旧批次可与新批次并存"],
+        ["组合约束", "无法买入", "按信号名单预先等分预算，某ETF无法成交则对应预算留现金"],
         ["收益口径", "扣费后收益", "买入和卖出均扣除交易成本"],
         ["容量口径", "组合容量", "各持仓ETF容量的5%分位"],
     ]
@@ -2176,7 +2070,9 @@ def write_backtest_metrics_workbook(
     style_worksheet(parameter_sheet, max_width=50)
     percentage_parameters = {
         "调仓日入选比例",
-        "每账户初始资金比例",
+        "固定跌幅止损比例",
+        "浮盈回撤启动比例",
+        "最高收盘价回撤比例",
         "年化无风险利率 r_f",
         "买入成本 c_buy",
         "卖出成本 c_sell",
@@ -2195,7 +2091,7 @@ def write_backtest_metrics_workbook(
 
     return save_workbook_atomic(
         workbook,
-        output_dir / f"{mode}_backtest_metrics.xlsx",
+        output_dir / f"{output_prefix(mode)}_backtest_metrics.xlsx",
     )
 
 
@@ -2229,7 +2125,7 @@ def write_holdings_workbook(
     sheet.column_dimensions["D"].width = 16
     return save_workbook_atomic(
         workbook,
-        output_dir / f"{mode}_holdings.xlsx",
+        output_dir / f"{output_prefix(mode)}_holdings.xlsx",
     )
 
 
@@ -2301,7 +2197,7 @@ def write_time_series_workbook(
     sheet.column_dimensions["I"].width = 30
     return save_workbook_atomic(
         workbook,
-        output_dir / f"{mode}_time_series.xlsx",
+        output_dir / f"{output_prefix(mode)}_time_series.xlsx",
     )
 
 
@@ -2312,14 +2208,14 @@ def write_account_details_workbook(
     trade_records: Sequence[AccountTradeRecord],
     output_dir: Path,
 ) -> Path:
-    """输出各独立账户的每日状态、账户持仓和实际交易差额。"""
+    """输出单账户状态及逐批次持仓/交易，保留入场价、计时与退出原因。"""
 
     workbook = Workbook()
     daily_sheet = workbook.active
     daily_sheet.title = "账户每日状态"
     daily_headers = [
         "日期", "账户编号", "账户净值", "ETF市值", "现金", "现金权重",
-        "当天是否调仓", "调仓是否成功", "当前信号日", "上次调仓日", "下次计划调仓日",
+        "当天是否有交易指令", "指令是否全部成交", "当前信号日", "上次成交日", "下次检查日",
     ]
     daily_sheet.append(daily_headers)
     for record in daily_records:
@@ -2351,10 +2247,13 @@ def write_account_details_workbook(
                 "yyyy-mm-dd"
             )
 
-    holding_sheet = workbook.create_sheet("账户持仓")
+    holding_sheet = workbook.create_sheet("批次持仓")
     holding_headers = [
         "日期", "账户编号", "信号日", "ETF代码", "ETF名称", "ETF市值",
         "账户内部权重", "对总组合贡献权重",
+        "批次编号", "买入日期", "买入成交价", "持有数量", "持有交易日",
+        "固定止损价", "最高收盘价", "最高浮盈", "浮盈回撤是否启用",
+        "浮盈回撤退出价", "待执行卖出原因",
     ]
     holding_sheet.append(holding_headers)
     for record in holding_records:
@@ -2368,23 +2267,33 @@ def write_account_details_workbook(
                 record.market_value,
                 record.account_weight,
                 record.total_portfolio_weight,
+                record.batch_id, record.buy_date, record.buy_price, record.shares,
+                record.holding_days, record.stop_price, record.highest_close,
+                record.max_return, "是" if record.trailing_active else "否",
+                record.trailing_stop_price, record.pending_exit_reason,
             ]
         )
     style_worksheet(
         holding_sheet,
-        percent_headers={"账户内部权重", "对总组合贡献权重"},
-        decimal_headers={"ETF市值"},
+        percent_headers={"账户内部权重", "对总组合贡献权重", "最高浮盈"},
+        decimal_headers={
+            "ETF市值", "买入成交价", "持有数量", "固定止损价",
+            "最高收盘价", "浮盈回撤退出价",
+        },
         integer_headers={"账户编号"},
         max_width=32,
     )
     for row_number in range(2, holding_sheet.max_row + 1):
         holding_sheet.cell(row=row_number, column=1).number_format = "yyyy-mm-dd"
         holding_sheet.cell(row=row_number, column=3).number_format = "yyyy-mm-dd"
+        holding_sheet.cell(row=row_number, column=10).number_format = "yyyy-mm-dd"
 
-    trade_sheet = workbook.create_sheet("账户交易")
+    trade_sheet = workbook.create_sheet("批次交易")
     trade_headers = [
         "成交日期", "账户编号", "信号日", "ETF代码", "ETF名称", "交易方向",
         "交易前市值", "最新目标市值", "实际成交金额", "交易成本",
+        "批次编号", "买入日期", "买入成交价", "成交数量", "成交价格",
+        "交易原因", "信号收盘价", "信号日持有交易日", "信号时最高收盘价", "风控退出价",
     ]
     trade_sheet.append(trade_headers)
     for record in trade_records:
@@ -2400,21 +2309,29 @@ def write_account_details_workbook(
                 record.target_value,
                 record.trade_amount,
                 record.transaction_cost,
+                record.batch_id, record.buy_date, record.buy_price, record.shares,
+                record.execution_price, record.reason, record.signal_price, record.signal_holding_days,
+                record.signal_peak_price, record.risk_exit_price,
             ]
         )
     style_worksheet(
         trade_sheet,
-        decimal_headers={"交易前市值", "最新目标市值", "实际成交金额", "交易成本"},
+        decimal_headers={
+            "交易前市值", "最新目标市值", "实际成交金额", "交易成本",
+            "买入成交价", "成交数量", "成交价格", "信号收盘价",
+            "信号时最高收盘价", "风控退出价",
+        },
         integer_headers={"账户编号"},
         max_width=32,
     )
     for row_number in range(2, trade_sheet.max_row + 1):
         trade_sheet.cell(row=row_number, column=1).number_format = "yyyy-mm-dd"
         trade_sheet.cell(row=row_number, column=3).number_format = "yyyy-mm-dd"
+        trade_sheet.cell(row=row_number, column=12).number_format = "yyyy-mm-dd"
 
     return save_workbook_atomic(
         workbook,
-        output_dir / f"{mode}_account_details.xlsx",
+        output_dir / f"{output_prefix(mode)}_batch_details.xlsx",
     )
 
 
@@ -2492,7 +2409,7 @@ def write_mode_figures(
     dates = [record.current_date for record in nav_records]
     comparison_dates = [baseline_date, *dates]
 
-    nav_path = output_dir / f"{mode}_cumulative_nav.png"
+    nav_path = output_dir / f"{output_prefix(mode)}_cumulative_nav.png"
     figure, axis = plt.subplots(figsize=(10.0, 4.8), facecolor="white")
     axis.plot(
         comparison_dates,
@@ -2516,7 +2433,7 @@ def write_mode_figures(
     style_plot_axis(axis)
     save_figure_atomic(figure, nav_path)
 
-    excess_path = output_dir / f"{mode}_cumulative_excess.png"
+    excess_path = output_dir / f"{output_prefix(mode)}_cumulative_excess.png"
     figure, axis = plt.subplots(figsize=(10.0, 4.8), facecolor="white")
     axis.plot(
         comparison_dates,
@@ -2541,7 +2458,7 @@ def write_mode_figures(
     style_plot_axis(axis)
     save_figure_atomic(figure, excess_path)
 
-    turnover_path = output_dir / f"{mode}_turnover.png"
+    turnover_path = output_dir / f"{output_prefix(mode)}_turnover.png"
     figure, axis = plt.subplots(figsize=(10.0, 4.5), facecolor="white")
     axis.bar(
         range(len(nav_records)),
@@ -2562,7 +2479,7 @@ def write_mode_figures(
     style_plot_axis(axis)
     save_figure_atomic(figure, turnover_path)
 
-    cost_path = output_dir / f"{mode}_transaction_cost.png"
+    cost_path = output_dir / f"{output_prefix(mode)}_transaction_cost.png"
     figure, axis = plt.subplots(figsize=(10.0, 4.5), facecolor="white")
     axis.plot(
         dates,
@@ -2586,7 +2503,7 @@ def write_mode_figures(
     style_plot_axis(axis)
     save_figure_atomic(figure, cost_path)
 
-    capacity_path = output_dir / f"{mode}_capacity.png"
+    capacity_path = output_dir / f"{output_prefix(mode)}_capacity.png"
     capacity_dates = [
         record.current_date for record in nav_records if record.capacity is not None
     ]
@@ -2618,6 +2535,90 @@ def write_mode_figures(
     style_plot_axis(axis)
     save_figure_atomic(figure, capacity_path)
     return [nav_path, excess_path, turnover_path, cost_path, capacity_path]
+
+
+def validate_batch_accounting(
+    mode: str,
+    nav_records: Sequence[NavRecord],
+    holding_records: Sequence[AccountHoldingRecord],
+    trade_records: Sequence[AccountTradeRecord],
+) -> None:
+    """验证新增批次规则、最低持有期及现金账目；收益指标校验沿用原逻辑。"""
+    date_positions = {row.current_date: i for i, row in enumerate(nav_records)}
+    trades_by_date: dict[date, list[AccountTradeRecord]] = defaultdict(list)
+    holdings_by_date: dict[date, list[AccountHoldingRecord]] = defaultdict(list)
+    for row in trade_records:
+        trades_by_date[row.execution_date].append(row)
+    for row in holding_records:
+        holdings_by_date[row.current_date].append(row)
+    live: dict[int, AccountTradeRecord] = {}
+    seen: set[int] = set()
+    cash = INITIAL_NAV
+    for nav in nav_records:
+        trades = trades_by_date[nav.current_date]
+        risk_exits = {
+            r.etf_code for r in trades
+            if r.reason in {"固定止损", "浮盈回撤"}
+        }
+        buys = [r for r in trades if r.direction == "买入"]
+        if risk_exits.intersection(r.etf_code for r in buys):
+            raise RuntimeError(f"{mode}同轮风控退出ETF被重新买入")
+        if buys and not all(math.isclose(r.trade_amount, buys[0].trade_amount, abs_tol=1e-12) for r in buys):
+            raise RuntimeError(f"{mode}当轮新资金未等额分配")
+        for row in trades:
+            if row.signal_date is None or row.signal_date > row.execution_date or (mode == "next_day_vwap" and row.signal_date == row.execution_date):
+                raise RuntimeError(f"{mode}批次交易信号时序不正确")
+            if not math.isclose(row.shares * row.execution_price, row.trade_amount, abs_tol=1e-12):
+                raise RuntimeError(f"{mode}批次成交金额不能由数量和价格重建")
+            if row.direction == "买入":
+                if row.batch_id in seen or row.buy_date != row.execution_date:
+                    raise RuntimeError(f"{mode}新增买入没有独立批次")
+                seen.add(row.batch_id)
+                live[row.batch_id] = row
+                cash -= row.trade_amount + row.transaction_cost
+            else:
+                old = live.pop(row.batch_id, None)
+                if old is None or old.shares != row.shares or old.buy_price != row.buy_price:
+                    raise RuntimeError(f"{mode}卖出批次数量或买入基准被改变")
+                age = date_positions[row.signal_date] - date_positions[old.buy_date]
+                if row.signal_holding_days != age:
+                    raise RuntimeError(f"{mode}批次持有期计数不正确")
+                if row.reason == "到期未入选" and age < MIN_HOLD_DAYS:
+                    raise RuntimeError(f"{mode}未满最短持有期发生普通卖出")
+                if row.reason == "固定止损" and (row.signal_price is None or row.signal_price > old.buy_price * (1.0 - STOP_LOSS_PCT)):
+                    raise RuntimeError(f"{mode}固定止损未达到阈值")
+                if row.reason == "浮盈回撤":
+                    if (
+                        row.signal_price is None
+                        or row.signal_peak_price is None
+                        or row.risk_exit_price is None
+                        or row.signal_peak_price
+                        < old.buy_price * (1.0 + PROFIT_TRAILING_TRIGGER_PCT)
+                        or row.signal_price
+                        > row.signal_peak_price
+                        * (1.0 - PROFIT_TRAILING_DRAWDOWN_PCT)
+                        or not math.isclose(
+                            row.risk_exit_price,
+                            row.signal_peak_price
+                            * (1.0 - PROFIT_TRAILING_DRAWDOWN_PCT),
+                            abs_tol=1e-12,
+                        )
+                    ):
+                        raise RuntimeError(f"{mode}浮盈回撤退出未达到阈值")
+                cash += row.trade_amount - row.transaction_cost
+        held = holdings_by_date[nav.current_date]
+        if len(held) != len(live) or {r.batch_id for r in held} != set(live):
+            raise RuntimeError(f"{mode}批次持仓与交易记录不一致")
+        for row in held:
+            old = live[row.batch_id]
+            if row.shares != old.shares or row.buy_price != old.buy_price or row.buy_date != old.buy_date:
+                raise RuntimeError(f"{mode}未卖出批次发生调权或买入基准重置")
+            if row.holding_days != date_positions[nav.current_date] - date_positions[old.buy_date]:
+                raise RuntimeError(f"{mode}批次持有期被重置")
+        if not math.isclose(cash, nav.nav * nav.cash_weight, abs_tol=2e-10):
+            raise RuntimeError(f"{mode}现金不能由实际成交与费用重建")
+        if not math.isclose(cash + sum(r.market_value for r in held), nav.nav, abs_tol=2e-10):
+            raise RuntimeError(f"{mode}批次市值与现金无法重建净值")
 
 
 def validate_mode_outputs(
@@ -2662,47 +2663,13 @@ def validate_mode_outputs(
     account_rows_by_date: dict[date, list[AccountDailyRecord]] = defaultdict(list)
     for record in account_daily_records:
         account_rows_by_date[record.current_date].append(record)
-    first_rebalance_position = 0 if mode == "close" else 1
-    for date_position, nav_record in enumerate(nav_records):
-        current_date = nav_record.current_date
-        rows = account_rows_by_date.get(current_date, [])
-        if len(rows) != ACCOUNT_COUNT:
-            raise RuntimeError(
-                f"{mode}账户校验失败：{current_date}不是{ACCOUNT_COUNT}个账户"
-            )
-        account_nav_sum = sum(row.account_nav for row in rows)
-        if not math.isclose(account_nav_sum, nav_record.nav, abs_tol=2e-12):
-            raise RuntimeError(f"{mode}账户校验失败：{current_date}账户净值合计不一致")
-        attempted_count = sum(row.rebalance_attempted for row in rows)
-        if REBALANCE_MODE == "rebalance":
-            expected_attempted = int(
-                date_position >= first_rebalance_position
-                and (
-                    date_position - first_rebalance_position
-                ) % ACCOUNT_REBALANCE_INTERVAL == 0
-            )
-        else:
-            expected_attempted = int(date_position >= first_rebalance_position)
-        if attempted_count != expected_attempted:
-            raise RuntimeError(f"{mode}账户校验失败：{current_date}调仓账户数不正确")
-
-    date_positions = {
-        record.current_date: position for position, record in enumerate(nav_records)
-    }
-    attempted_dates_by_account: dict[int, list[date]] = defaultdict(list)
-    for record in account_daily_records:
-        if record.rebalance_attempted:
-            attempted_dates_by_account[record.account_id].append(record.current_date)
-    for account_id, attempted_dates in attempted_dates_by_account.items():
-        gaps = [
-            date_positions[later] - date_positions[earlier]
-            for earlier, later in zip(attempted_dates, attempted_dates[1:])
-        ]
-        if any(gap != ACCOUNT_REBALANCE_INTERVAL for gap in gaps):
-            raise RuntimeError(
-                f"{mode}账户校验失败：账户{account_id}并非每"
-                f"{ACCOUNT_REBALANCE_INTERVAL}个交易日调仓"
-            )
+    for nav_record in nav_records:
+        rows = account_rows_by_date.get(nav_record.current_date, [])
+        if len(rows) != 1 or rows[0].account_id != 1:
+            raise RuntimeError(f"{mode}单账户记录不正确")
+        if not math.isclose(rows[0].account_nav, nav_record.nav, abs_tol=2e-12):
+            raise RuntimeError(f"{mode}账户净值与组合净值不一致")
+    validate_batch_accounting(mode, nav_records, account_holding_records, account_trade_records)
 
     trade_cost_by_date: dict[date, float] = defaultdict(float)
     for record in account_trade_records:
@@ -2716,43 +2683,48 @@ def validate_mode_outputs(
             raise RuntimeError(f"{mode}账户校验失败：{current_date}交易成本不一致")
 
     expected_workbooks = {
-        f"{mode}_annual_metrics.xlsx": ["annual_metrics"],
-        f"{mode}_backtest_metrics.xlsx": ["performance", "parameters"],
-        f"{mode}_holdings.xlsx": ["holdings"],
-        f"{mode}_time_series.xlsx": ["time_series"],
-        f"{mode}_account_details.xlsx": ["账户每日状态", "账户持仓", "账户交易"],
+        f"{output_prefix(mode)}_annual_metrics.xlsx": ["annual_metrics"],
+        f"{output_prefix(mode)}_backtest_metrics.xlsx": ["performance", "parameters"],
+        f"{output_prefix(mode)}_holdings.xlsx": ["holdings"],
+        f"{output_prefix(mode)}_time_series.xlsx": ["time_series"],
+        f"{output_prefix(mode)}_batch_details.xlsx": ["账户每日状态", "批次持仓", "批次交易"],
     }
     expected_headers = {
-        (f"{mode}_annual_metrics.xlsx", "annual_metrics"): [
+        (f"{output_prefix(mode)}_annual_metrics.xlsx", "annual_metrics"): [
             "年份", "策略收益", "基准收益", "超额收益", "年化波动",
             "跟踪误差", "Sharpe", "Sortino", "信息比率", "策略最大回撤",
             "基准最大回撤", "超额最大回撤", "Calmar", "年化换手率（单边）",
         ],
-        (f"{mode}_backtest_metrics.xlsx", "performance"): [
+        (f"{output_prefix(mode)}_backtest_metrics.xlsx", "performance"): [
             "类别", "指标", "ETF趋势策略",
         ],
-        (f"{mode}_backtest_metrics.xlsx", "parameters"): [
+        (f"{output_prefix(mode)}_backtest_metrics.xlsx", "parameters"): [
             "类别", "参数 / 约束", "本项目设置",
         ],
-        (f"{mode}_holdings.xlsx", "holdings"): [
+        (f"{output_prefix(mode)}_holdings.xlsx", "holdings"): [
             "日期", "ETF代码", "ETF名称", "权重",
         ],
-        (f"{mode}_time_series.xlsx", "time_series"): [
+        (f"{output_prefix(mode)}_time_series.xlsx", "time_series"): [
             "日期", "策略日收益", "策略累计净值", "基准日收益",
             "基准累计净值", "主动日收益", "超额净值",
             "每日换仓比率（单边）", "策略可容纳规模（亿元）",
         ],
-        (f"{mode}_account_details.xlsx", "账户每日状态"): [
+        (f"{output_prefix(mode)}_batch_details.xlsx", "账户每日状态"): [
             "日期", "账户编号", "账户净值", "ETF市值", "现金", "现金权重",
-            "当天是否调仓", "调仓是否成功", "当前信号日", "上次调仓日", "下次计划调仓日",
+            "当天是否有交易指令", "指令是否全部成交", "当前信号日", "上次成交日", "下次检查日",
         ],
-        (f"{mode}_account_details.xlsx", "账户持仓"): [
+        (f"{output_prefix(mode)}_batch_details.xlsx", "批次持仓"): [
             "日期", "账户编号", "信号日", "ETF代码", "ETF名称", "ETF市值",
             "账户内部权重", "对总组合贡献权重",
+            "批次编号", "买入日期", "买入成交价", "持有数量", "持有交易日",
+            "固定止损价", "最高收盘价", "最高浮盈", "浮盈回撤是否启用",
+            "浮盈回撤退出价", "待执行卖出原因",
         ],
-        (f"{mode}_account_details.xlsx", "账户交易"): [
+        (f"{output_prefix(mode)}_batch_details.xlsx", "批次交易"): [
             "成交日期", "账户编号", "信号日", "ETF代码", "ETF名称", "交易方向",
             "交易前市值", "最新目标市值", "实际成交金额", "交易成本",
+            "批次编号", "买入日期", "买入成交价", "成交数量", "成交价格",
+            "交易原因", "信号收盘价", "信号日持有交易日", "信号时最高收盘价", "风控退出价",
         ],
     }
     actual_workbooks = {path.name: path for path in workbook_paths}
@@ -2768,8 +2740,9 @@ def validate_mode_outputs(
                 )
             for sheet in workbook.worksheets:
                 allow_header_only = (
-                    filename == f"{mode}_account_details.xlsx"
-                    and sheet.title in {"账户持仓", "账户交易"}
+                    (filename == f"{output_prefix(mode)}_batch_details.xlsx"
+                     and sheet.title in {"批次持仓", "批次交易"})
+                    or filename == f"{output_prefix(mode)}_holdings.xlsx"
                 )
                 if (sheet.max_row < 2 and not allow_header_only) or sheet.max_column < 1:
                     raise RuntimeError(f"{filename}/{sheet.title}没有有效数据")
@@ -2791,15 +2764,13 @@ def validate_mode_outputs(
 def main() -> None:
     validate_parameters()
     benchmark = load_benchmark_data()
-    if REBALANCE_MODE == "rebalance":
-        rebalance_description = (
-            f"全组合每 {ACCOUNT_REBALANCE_INTERVAL} 个交易日调仓一次"
-        )
-    else:
-        rebalance_description = (
-            f"初始资金分成 {ACCOUNT_COUNT} 个独立账户，每天轮换1个账户，"
-            f"每账户持有 {ACCOUNT_REBALANCE_INTERVAL} 个交易日"
-        )
+    rebalance_description = (
+        f"单账户每日轮动；最短持有{MIN_HOLD_DAYS}个交易日，"
+        f"固定止损{STOP_LOSS_PCT:.1%}，浮盈达到"
+        f"{PROFIT_TRAILING_TRIGGER_PCT:.1%}后从最高收盘价回撤"
+        f"{PROFIT_TRAILING_DRAWDOWN_PCT:.1%}退出；"
+        "按买入批次独立管理，仅现金和卖出资金等额投入，原持仓不调权"
+    )
     print(
         f"聚类阈值 {CLUSTER_CORRELATION_THRESHOLD:g}，"
         f"趋势窗口 {TREND_WINDOW}，选择调仓信号日得分前 {TOP_PERCENT:.0%}；"
@@ -2807,7 +2778,7 @@ def main() -> None:
         f"RSI{RSI_PERIOD}不大于 {RSI_NEUTRAL_LEVEL:g} 或"
         f"BIAS{BIAS_PERIOD}不大于 {BIAS_NEUTRAL_LEVEL:g} 的指数，"
         f"{rebalance_description}；"
-        "本次依次回测两种得分公式。",
+        f"本次回测{len(SCORE_METHODS_TO_RUN)}种得分公式。",
         flush=True,
     )
     print(
@@ -2822,6 +2793,7 @@ def main() -> None:
             BACKTEST_DIR
             / score_method
             / STRATEGY_VARIANT_DIR
+            / SELECTION_VARIANT_DIR
             / ACCOUNT_VARIANT_DIR
             / INDICATOR_VARIANT_DIR
         )
