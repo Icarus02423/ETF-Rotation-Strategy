@@ -34,7 +34,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # ============================= 行情参数 =============================
 # 必须与要读取的聚类结果阈值一致，可改为0.7、0.8或0.9。
-CLUSTER_CORRELATION_THRESHOLD = 0.9
+CLUSTER_CORRELATION_THRESHOLD = 0.7
 
 TREND_HISTORY_LOOKBACK_CALENDAR_DAYS = 180
 TREND_MAX_LOOKBACK_CALENDAR_DAYS = 730

@@ -50,7 +50,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # ============================= 因子参数 =============================
 # 聚类结果阈值，可改为0.7、0.8或0.9。
-CLUSTER_CORRELATION_THRESHOLD = 0.7
+CLUSTER_CORRELATION_THRESHOLD = 0.8
 
 # 趋势回归窗口，可改为5, 10 或 15。
 TREND_WINDOW = 15

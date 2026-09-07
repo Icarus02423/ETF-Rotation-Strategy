@@ -48,7 +48,7 @@ INITIAL_SELECTION_DIR = PROJECT_ROOT / "outputs" / "etf_pool" / "initial"
 ETF_DATA_FILE = PROJECT_ROOT / "outputs" / "etf_data" / "etf_data.csv"
 # ============================= 聚类参数 =============================
 # 可改为0.7、0.8或0.9；距离阈值自动按1 - CORRELATION_THRESHOLD计算。
-CORRELATION_THRESHOLD = 0.9
+CORRELATION_THRESHOLD = 0.7
 ALLOWED_CORRELATION_THRESHOLDS = (0.7, 0.8, 0.9)
 
 RETURN_TRADING_DAYS = 60

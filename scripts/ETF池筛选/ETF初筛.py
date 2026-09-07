@@ -4,14 +4,16 @@
 按月筛选ETF池，并按对标指数或 benchmark 去重。
 
 筛选规则：
-1. 截至当月最后一个交易日，ETF上市满1年；
-2. 当日基金规模 > 1亿元；
-3. 包含当日在内的过去20个市场交易日平均成交额 > 2000万元；
-4. 对标指数代码不能为空，缺失的ETF在去重前排除；
-5. 对标指数相同或 benchmark 相同的ETF归为一类，每类只保留规模最大的ETF。
+1. 只保留股票型ETF中的行业指数ETF；
+2. 截至当月最后一个交易日，ETF上市满1年；
+3. 当日基金规模 > 1亿元；
+4. 包含当日在内的过去20个市场交易日平均成交额 > 2000万元；
+5. 对标指数代码不能为空，缺失的ETF在去重前排除；
+6. 对标指数相同或 benchmark 相同的ETF归为一类，每类只保留规模最大的ETF。
 
 说明：
-- 只筛选 SELECTED_MAJOR_CATEGORIES 参数指定的ETF大类；
+- 只筛选 SELECTED_MAJOR_CATEGORIES 和 SELECTED_MINOR_CATEGORIES
+  参数共同指定的ETF大类与细类；
 - 停牌日或成交额空值按0计入20日平均成交额，分母固定为20；
 - 每次运行都会清理输出目录中已有的CSV，再生成本次结果；
 - CSV文件名使用该月最后一个实际交易日，例如2021年1月使用2021_01_29.csv；
@@ -41,8 +43,9 @@ START_YEAR = 2021
 END_YEAR = 2026
 # 最后一个已经完整结束的自然月；不要填写仍在进行中的月份。
 END_MONTH = 7
-# 只处理这里指定的大类；以后增删类型只需要修改这个元组。
+# 只处理这里指定的大类和细类。
 SELECTED_MAJOR_CATEGORIES = ("股票型ETF",)
+SELECTED_MINOR_CATEGORIES = ("行业指数ETF",)
 MIN_LISTED_YEARS = 1
 MIN_FUND_SCALE = 100_000_000.0
 TURNOVER_LOOKBACK_DAYS = 20
@@ -54,6 +57,7 @@ REQUIRED_COLUMNS = {
     "代码",
     "上市日期",
     "类别大类",
+    "类别细类",
     "对标指数",
     "benchmark",
     "对标指数代码",
@@ -142,15 +146,15 @@ def normalized_group_value(value: object) -> str:
     return " ".join(clean_text(value).split()).casefold()
 
 
-def selected_major_category(value: object) -> bool:
-    """判断一行数据是否属于参数指定的大类。"""
+def selected_category(value: object, selected_categories: Sequence[str]) -> bool:
+    """判断一行数据是否属于参数指定的类别。"""
 
     row_categories = {
         category.strip()
         for category in clean_text(value).split("|")
         if category.strip()
     }
-    return bool(row_categories.intersection(SELECTED_MAJOR_CATEGORIES))
+    return bool(row_categories.intersection(selected_categories))
 
 
 def listed_anniversary(listed_date: date, years: int) -> date:
@@ -272,7 +276,11 @@ def collect_month_data(
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
-            if not selected_major_category(row.get("类别大类")):
+            if not selected_category(
+                row.get("类别大类"), SELECTED_MAJOR_CATEGORIES
+            ) or not selected_category(
+                row.get("类别细类"), SELECTED_MINOR_CATEGORIES
+            ):
                 continue
             code = clean_text(row.get("代码"))
             if not code:
@@ -393,10 +401,16 @@ def main() -> None:
         raise ValueError("TURNOVER_LOOKBACK_DAYS必须大于0")
     if not SELECTED_MAJOR_CATEGORIES:
         raise ValueError("SELECTED_MAJOR_CATEGORIES不能为空")
+    if not SELECTED_MINOR_CATEGORIES:
+        raise ValueError("SELECTED_MINOR_CATEGORIES不能为空")
 
     print(f"读取ETF数据：{INPUT_FILE}", flush=True)
     print(
         f"筛选ETF大类：{'、'.join(SELECTED_MAJOR_CATEGORIES)}",
+        flush=True,
+    )
+    print(
+        f"筛选ETF细类：{'、'.join(SELECTED_MINOR_CATEGORIES)}",
         flush=True,
     )
     fieldnames, available_dates = inspect_input_dates(INPUT_FILE)
