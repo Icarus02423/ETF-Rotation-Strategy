@@ -241,7 +241,7 @@ def load_factor_signals() -> pd.DataFrame:
             }
             frame["score_method"] = frame["score_column"].map(score_labels)
             frame = frame.drop(columns="score_column")
-            frame["threshold"] = threshold
+            frame["threshold_0.9"] = threshold
             frame["trend_window"] = trend_window
             frames.append(frame)
 
@@ -254,7 +254,7 @@ def load_factor_signals() -> pd.DataFrame:
     signals = signals[signals["score"].map(math.isfinite)]
     signals = signals.drop_duplicates(
         subset=[
-            "threshold",
+            "threshold_0.9",
             "trend_window",
             "signal_date",
             "index_code",
@@ -264,7 +264,7 @@ def load_factor_signals() -> pd.DataFrame:
     )
     signals = signals.sort_values(
         [
-            "threshold",
+            "threshold_0.9",
             "trend_window",
             "signal_date",
             "score_method",
@@ -408,7 +408,7 @@ def load_index_closes(
 
     required_codes = {
         float(threshold): set(group["index_code"])
-        for threshold, group in signals.groupby("threshold", sort=True)
+        for threshold, group in signals.groupby("threshold_0.9", sort=True)
     }
     prices: dict[tuple[float, date, str], float] = {}
 
@@ -446,7 +446,7 @@ def load_index_closes(
                     abs_tol=1e-8,
                 ):
                     raise ValueError(
-                        f"指数收盘价冲突：threshold={threshold:g}, "
+                        f"指数收盘价冲突：threshold_0.9={threshold:g}, "
                         f"date={current_date}, index={index_code}, "
                         f"values=({existing}, {close})"
                     )
@@ -581,7 +581,7 @@ def rank_ic_status(
 def calculate_factor_distribution(signals: pd.DataFrame) -> pd.DataFrame:
     records: list[dict[str, object]] = []
     for (threshold, trend_window), group in signals.groupby(
-        ["threshold", "trend_window"], sort=True
+        ["threshold_0.9", "trend_window"], sort=True
     ):
         scores = group["score"].astype(float)
         records.append(
@@ -683,7 +683,7 @@ def research_score_method(
     missing_samples: list[dict[str, object]] = []
     anomaly_serial = 0
 
-    group_columns = ["threshold", "trend_window", "signal_date"]
+    group_columns = ["threshold_0.9", "trend_window", "signal_date"]
     for (threshold, trend_window, signal_date), group in method_signals.groupby(
         group_columns, sort=True
     ):

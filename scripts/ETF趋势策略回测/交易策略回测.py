@@ -4,24 +4,23 @@
 ETF趋势轮动策略回测。
 
 策略：
-1. 分别按两种趋势得分降序选择前10%的代表指数；
-2. 排名后仅保留当前趋势窗口收益率大于0的指数，不向后补选；
+1. 对全体有效代表指数按配置应用高波动和BIAS过滤，不要求窗口收益率为正；
+2. 在过滤后的合格指数池中分别按两种趋势得分降序取前10%，数量向上取整；
 3. 对每个保留指数，在当日所有跟踪该指数且成交量大于0的ETF中，
    选择成交量最大者；成交量相同时依次比较成交额、规模和ETF代码；
-4. 单个指数权重按过滤前计划入选数量等权，空缺权重保留为现金；
+4. 对过滤后成功匹配的ETF等权配置；没有候选时，当天调仓账户空仓；
 5. 分别按信号日收盘价和下一交易日VWAP成交；
-6. 支持两种调仓模式：固定x日全组合调仓，或将资金分成x个独立账户，
-   每天轮换一个账户、每个账户持有x个交易日；
+6. 将资金分成d个独立账户，每天轮换一个账户、每个账户持有d个交易日；
 7. 买入和卖出均收取0.1%的单边交易成本。
 
 输入：
 - outputs/etf_trend_strategy/threshold_<阈值>/factors/window_<窗口>/YYYY.csv
+- outputs/etf_trend_strategy/threshold_<阈值>/index_prices/*.csv（过滤指标）
 - outputs/etf_data/etf_data.csv
 - outputs/benchmark_data/*.csv（按BENCHMARK_CODE选择）
 
 输出：
-- 固定x日：post_rank_positive_return/rebalance_<x>d/<成交方式>/
-- x账户错峰：post_rank_positive_return/staggered_<x>_accounts_hold_<x>d/<成交方式>/
+- d账户错峰：<得分公式>/staggered_<d>d/<成交方式>/
   每个交易模式独立输出年度指标、总回测指标、合并持仓、时序和账户明细五个Excel，
   以及累计净值、累计超额、换手率、累计交易成本和策略容量五张图。
 """
@@ -31,6 +30,7 @@ from __future__ import annotations
 import csv
 import math
 import statistics
+from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -50,27 +50,26 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # ============================= 回测参数 =============================
 CLUSTER_CORRELATION_THRESHOLD = 0.9
-TREND_WINDOW = 20
+TREND_WINDOW = 15
 # 评价基准代码；需与“下载基准数据.py”中的BENCHMARK_CODE保持一致。
 BENCHMARK_CODE = "000510.CSI"
 # 默认一次运行两种得分。若以后只想跑其中一种，可只保留对应英文键。
 SCORE_METHODS_TO_RUN = ("return_r2", "return_vol")
 TOP_PERCENT = 0.10
-# "rebalance"：全组合每x个交易日调仓；"staggered"：x个账户逐日错峰持有x日。
-REBALANCE_MODE = "staggered"
-ACCOUNT_REBALANCE_INTERVAL = 10
-ACCOUNT_COUNT = (
-    1 if REBALANCE_MODE == "rebalance" else ACCOUNT_REBALANCE_INTERVAL
-)
-MIN_WINDOW_RETURN = 0.0
-STRATEGY_VARIANT_DIR = "post_rank_positive_return"
-ACCOUNT_VARIANT_DIR = (
-    f"rebalance_{ACCOUNT_REBALANCE_INTERVAL}d"
-    if REBALANCE_MODE == "rebalance"
-    else (
-        f"staggered_{ACCOUNT_REBALANCE_INTERVAL}d"
-    )
-)
+# 错峰周期d：d个账户，每天轮换一个，各持有d个交易日。
+ACCOUNT_REBALANCE_INTERVAL = 7
+ACCOUNT_COUNT = ACCOUNT_REBALANCE_INTERVAL
+# 排名前过滤；关闭两项即为无过滤对照。上下限为实验初值，非优化结果。
+VOL_FILTER_ENABLED = True
+VOL_RETURN_DAYS = 20  # 日收益个数，使用21个收盘价；独立于趋势窗口。
+VOL_KEEP_TOP_RATIO = 0.50
+BIAS_MODE = "upper"  # none / lower / upper / both
+BIAS_WINDOW = 20  # 均线使用的收盘价个数，包含信号当日。
+BIAS_LOWER = -0.05  # lower、both：BIAS >= 下限。
+BIAS_UPPER = +0.50  # upper、both：BIAS <= 上限。
+# 与趋势因子计算的历史价格有效期保持一致。
+MAX_PRICE_STALENESS_CALENDAR_DAYS = 7
+ACCOUNT_VARIANT_DIR = f"staggered_{ACCOUNT_REBALANCE_INTERVAL}d"
 TRANSACTION_COST_RATE = 0.001
 ANNUAL_TRADING_DAYS = 252
 ANNUAL_RISK_FREE_RATE = 0.015
@@ -80,7 +79,7 @@ CAPACITY_DESCENDING_QUANTILE = 0.95
 # ====================================================================
 
 ALLOWED_CLUSTER_THRESHOLDS = (0.7, 0.8, 0.9)
-ALLOWED_TREND_WINDOWS = (20, 40, 60)
+ALLOWED_TREND_WINDOWS = (10, 15, 20, 40, 60)
 SCORE_COLUMNS = {
     "return_r2": "趋势质量因子",
     "return_vol": "风险调整趋势得分",
@@ -98,13 +97,14 @@ FACTOR_DIR = (
     / f"window_{TREND_WINDOW}"
 )
 ETF_DATA_FILE = PROJECT_ROOT / "outputs" / "etf_data" / "etf_data.csv"
+INDEX_RAW_DATA_DIR = FACTOR_DIR.parent.parent / "index_prices"
 BENCHMARK_DIR = PROJECT_ROOT / "outputs" / "benchmark_data"
 BACKTEST_DIR = (
     PROJECT_ROOT
     / "outputs"
     / "etf_trend_strategy"
     / f"threshold_{CLUSTER_CORRELATION_THRESHOLD:g}"
-    / "backtests"
+    / "threshold_0.9"
     / f"window_{TREND_WINDOW}"
 )
 
@@ -145,10 +145,7 @@ class DailyFactorSelection:
     signal_date: date
     planned_index_count: int
     members: tuple[FactorMember, ...]
-
-    @property
-    def filtered_index_count(self) -> int:
-        return self.planned_index_count - len(self.members)
+    filtered_index_count: int = 0  # 全池在趋势排名前被过滤的指数数。
 
 
 @dataclass(frozen=True)
@@ -183,10 +180,7 @@ class DailyTarget:
     planned_index_count: int
     selected_index_count: int
     members: tuple[TargetMember, ...]
-
-    @property
-    def filtered_index_count(self) -> int:
-        return self.planned_index_count - self.selected_index_count
+    filtered_index_count: int = 0
 
     @property
     def unmapped_index_count(self) -> int:
@@ -527,7 +521,7 @@ def validate_parameters() -> None:
     ):
         raise ValueError("CLUSTER_CORRELATION_THRESHOLD只能设为0.7、0.8或0.9")
     if TREND_WINDOW not in ALLOWED_TREND_WINDOWS:
-        raise ValueError("TREND_WINDOW只能设为20、40或60")
+        raise ValueError(f"TREND_WINDOW只能设为{ALLOWED_TREND_WINDOWS}")
     invalid_score_methods = [
         method for method in SCORE_METHODS_TO_RUN if method not in SCORE_COLUMNS
     ]
@@ -540,8 +534,6 @@ def validate_parameters() -> None:
         raise ValueError("SCORE_METHODS_TO_RUN不能包含重复得分方法")
     if not 0 < TOP_PERCENT <= 1:
         raise ValueError("TOP_PERCENT必须在0到1之间")
-    if REBALANCE_MODE not in {"rebalance", "staggered"}:
-        raise ValueError("REBALANCE_MODE只能设为rebalance或staggered")
     if not isinstance(ACCOUNT_COUNT, int) or ACCOUNT_COUNT <= 0:
         raise ValueError("ACCOUNT_COUNT必须是正整数")
     if (
@@ -549,15 +541,24 @@ def validate_parameters() -> None:
         or ACCOUNT_REBALANCE_INTERVAL <= 0
     ):
         raise ValueError("ACCOUNT_REBALANCE_INTERVAL必须是正整数")
-    expected_account_count = (
-        1 if REBALANCE_MODE == "rebalance" else ACCOUNT_REBALANCE_INTERVAL
-    )
-    if ACCOUNT_COUNT != expected_account_count:
-        raise ValueError(
-            "ACCOUNT_COUNT与REBALANCE_MODE、ACCOUNT_REBALANCE_INTERVAL不一致"
-        )
-    if not math.isfinite(MIN_WINDOW_RETURN):
-        raise ValueError("MIN_WINDOW_RETURN必须是有限数值")
+    if ACCOUNT_COUNT != ACCOUNT_REBALANCE_INTERVAL:
+        raise ValueError("错峰账户数必须等于ACCOUNT_REBALANCE_INTERVAL")
+    if not isinstance(VOL_FILTER_ENABLED, bool):
+        raise ValueError("VOL_FILTER_ENABLED必须是布尔值")
+    if not isinstance(VOL_RETURN_DAYS, int) or VOL_RETURN_DAYS < 2:
+        raise ValueError("VOL_RETURN_DAYS必须是至少2的整数")
+    if not 0 < VOL_KEEP_TOP_RATIO <= 1:
+        raise ValueError("VOL_KEEP_TOP_RATIO必须在0到1之间")
+    if BIAS_MODE not in {"none", "lower", "upper", "both"}:
+        raise ValueError("BIAS_MODE只能设为none、lower、upper或both")
+    if not isinstance(BIAS_WINDOW, int) or BIAS_WINDOW < 1:
+        raise ValueError("BIAS_WINDOW必须是正整数")
+    if not math.isfinite(BIAS_LOWER) or not math.isfinite(BIAS_UPPER):
+        raise ValueError("BIAS上下限必须是有限数值")
+    if BIAS_MODE == "both" and BIAS_LOWER > BIAS_UPPER:
+        raise ValueError("both模式的BIAS下限不能大于上限")
+    if MAX_PRICE_STALENESS_CALENDAR_DAYS < 0:
+        raise ValueError("价格允许滞后天数不能为负数")
     if TRANSACTION_COST_RATE < 0:
         raise ValueError("TRANSACTION_COST_RATE不能为负数")
     if not 0 < CAPACITY_DAILY_AMOUNT_RATIO <= 1:
@@ -566,6 +567,101 @@ def validate_parameters() -> None:
         raise ValueError("CAPACITY_DESCENDING_QUANTILE必须在0到1之间")
     if ANNUAL_TRADING_DAYS <= 0 or INITIAL_NAV <= 0:
         raise ValueError("年化交易日和初始净值必须大于0")
+
+
+def load_filter_price_history(
+    required_index_codes: set[str],
+) -> dict[str, tuple[list[date], list[float]]]:
+    """合并月度指数价格；重复日期只保留一个价格，并检查冲突。"""
+    files = sorted(INDEX_RAW_DATA_DIR.glob("*.csv"))
+    if not files:
+        raise FileNotFoundError(f"找不到过滤所需指数历史CSV：{INDEX_RAW_DATA_DIR}")
+    closes_by_code: dict[str, dict[date, float]] = defaultdict(dict)
+    for path in files:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            missing = {"收益日期", "对标指数代码", "收盘价"} - set(reader.fieldnames or [])
+            if missing:
+                raise ValueError(f"{path.name}缺少列：{sorted(missing)}")
+            for row_number, row in enumerate(reader, start=2):
+                index_code = clean_text(row.get("对标指数代码"))
+                if index_code not in required_index_codes:
+                    continue
+                price_date = parse_date(row.get("收益日期"), "收益日期")
+                close = positive_float(row.get("收盘价"))
+                if close is None:
+                    raise ValueError(f"{path.name}第{row_number}行收盘价无效")
+                existing = closes_by_code[index_code].get(price_date)
+                if existing is not None and not math.isclose(
+                    existing, close, rel_tol=1e-10, abs_tol=1e-10
+                ):
+                    raise ValueError(f"{index_code} {price_date}在不同月度文件的收盘价不一致")
+                closes_by_code[index_code][price_date] = close
+    history = {}
+    for index_code, closes in closes_by_code.items():
+        dates = sorted(closes)
+        history[index_code] = (dates, [closes[current_date] for current_date in dates])
+    return history
+
+
+def passes_bias_filter(bias: float) -> bool:
+    # 收盘价除均线的浮点误差不应把恰在闭区间边界的指数剔除。
+    if BIAS_MODE in {"lower", "both"} and bias < BIAS_LOWER and not math.isclose(
+        bias, BIAS_LOWER, rel_tol=0.0, abs_tol=1e-12
+    ):
+        return False
+    if BIAS_MODE in {"upper", "both"} and bias > BIAS_UPPER and not math.isclose(
+        bias, BIAS_UPPER, rel_tol=0.0, abs_tol=1e-12
+    ):
+        return False
+    return True
+
+
+def filter_eligible_members(
+    signal_date: date,
+    members: Sequence[FactorMember],
+    price_history: Mapping[str, tuple[Sequence[date], Sequence[float]]],
+) -> tuple[FactorMember, ...]:
+    """先过滤全池；波动资格来自BIAS过滤前的当日全体有效指数。"""
+    if not VOL_FILTER_ENABLED and BIAS_MODE == "none":
+        return tuple(members)
+    volatilities: dict[str, float] = {}
+    biases: dict[str, float] = {}
+    for member in members:
+        needs_bias = BIAS_MODE != "none"
+        required_prices = max(
+            VOL_RETURN_DAYS + 1 if VOL_FILTER_ENABLED else 0,
+            BIAS_WINDOW if needs_bias else 0,
+        )
+        price_dates, prices = price_history.get(member.index_code, ((), ()))
+        end = bisect_right(price_dates, signal_date)
+        if end < required_prices:
+            raise ValueError(
+                f"{signal_date} {member.index_code}过滤历史不足{required_prices}个收盘价"
+            )
+        if (signal_date - price_dates[end - 1]).days > MAX_PRICE_STALENESS_CALENDAR_DAYS:
+            raise ValueError(f"{signal_date} {member.index_code}过滤历史价格过期")
+        if VOL_FILTER_ENABLED:
+            window = prices[end - VOL_RETURN_DAYS - 1 : end]
+            daily_returns = [later / earlier - 1.0 for earlier, later in zip(window, window[1:])]
+            volatility = statistics.stdev(daily_returns)
+            if not math.isfinite(volatility):
+                raise ValueError(f"{signal_date} {member.index_code}过滤波动率无效")
+            volatilities[member.index_code] = volatility
+        if needs_bias:
+            bias_prices = prices[end - BIAS_WINDOW : end]
+            biases[member.index_code] = prices[end - 1] / statistics.mean(bias_prices) - 1.0
+    high_vol_codes: set[str] = set()
+    if VOL_FILTER_ENABLED:
+        keep_count = math.ceil(len(members) * VOL_KEEP_TOP_RATIO)
+        high_vol_codes = set(
+            sorted(volatilities, key=lambda code: (-volatilities[code], code))[:keep_count]
+        )
+    return tuple(
+        member for member in members
+        if (not VOL_FILTER_ENABLED or member.index_code in high_vol_codes)
+        and (BIAS_MODE == "none" or passes_bias_filter(biases[member.index_code]))
+    )
 
 
 def read_daily_top_factors(
@@ -608,15 +704,24 @@ def read_daily_top_factors(
                     window_return=window_return,
                 )
 
+    price_history = (
+        load_filter_price_history({code for members in members_by_date.values() for code in members})
+        if VOL_FILTER_ENABLED or BIAS_MODE != "none"
+        else {}
+    )
     daily_selections: dict[date, DailyFactorSelection] = {}
     for signal_date in sorted(members_by_date):
-        valid_members = sorted(
-            members_by_date[signal_date].values(),
-            key=lambda member: (-member.trend_factor, member.index_code),
-        )
+        valid_members = tuple(members_by_date[signal_date].values())
         if not valid_members:
             continue
-        planned_count = max(1, math.ceil(len(valid_members) * TOP_PERCENT))
+        eligible_members = filter_eligible_members(
+            signal_date, valid_members, price_history
+        )
+        sorted_members = sorted(
+            eligible_members,
+            key=lambda member: (-member.trend_factor, member.index_code),
+        )
+        planned_count = math.ceil(len(eligible_members) * TOP_PERCENT)
         ranked_members = tuple(
             FactorMember(
                 signal_date=member.signal_date,
@@ -626,18 +731,13 @@ def read_daily_top_factors(
                 window_return=member.window_return,
                 factor_rank=factor_rank,
             )
-            for factor_rank, member in enumerate(valid_members, start=1)
-        )
-        top_members = ranked_members[:planned_count]
-        filtered_members = tuple(
-            member
-            for member in top_members
-            if member.window_return > MIN_WINDOW_RETURN
+            for factor_rank, member in enumerate(sorted_members[:planned_count], start=1)
         )
         daily_selections[signal_date] = DailyFactorSelection(
             signal_date=signal_date,
             planned_index_count=planned_count,
-            members=filtered_members,
+            members=ranked_members,
+            filtered_index_count=len(valid_members) - len(eligible_members),
         )
     if not daily_selections:
         raise ValueError("趋势因子文件中没有有效因子")
@@ -708,7 +808,11 @@ def build_daily_targets(
 
     targets: dict[date, DailyTarget] = {}
     for signal_date, selection in sorted(daily_selections.items()):
-        target_weight = 1.0 / selection.planned_index_count
+        mapped_count = sum(
+            (signal_date, member.index_code) in best_by_date_index
+            for member in selection.members
+        )
+        target_weight = 1.0 / mapped_count if mapped_count else 0.0
         mapped: list[TargetMember] = []
         for member in selection.members:
             candidate = best_by_date_index.get((signal_date, member.index_code))
@@ -734,6 +838,7 @@ def build_daily_targets(
             planned_index_count=selection.planned_index_count,
             selected_index_count=len(selection.members),
             members=tuple(mapped),
+            filtered_index_count=selection.filtered_index_count,
         )
     if not trading_calendar:
         raise ValueError("etf_data.csv中没有有效交易日期")
@@ -1964,33 +2069,65 @@ def write_backtest_metrics_workbook(
     parameter_sheet = workbook.create_sheet("parameters")
     parameter_sheet.append(["类别", "参数 / 约束", "本项目设置"])
     execution_label = mode_execution_label(mode)
-    if REBALANCE_MODE == "rebalance":
-        account_structure_label = (
-            f"单账户每{ACCOUNT_REBALANCE_INTERVAL}个交易日全组合调仓"
-        )
-        planned_rebalance_label = "计划调仓日1个，其他交易日0个"
-        transfer_label = "不适用；单账户"
-    else:
-        account_structure_label = (
-            f"{ACCOUNT_COUNT}个独立账户逐日错峰持有"
-            f"{ACCOUNT_REBALANCE_INTERVAL}个交易日"
-        )
-        planned_rebalance_label = "每个交易日1个"
-        transfer_label = "无；各账户独立复利并保留自己的现金"
+    account_structure_label = (
+        f"{ACCOUNT_COUNT}个独立账户逐日错峰持有"
+        f"{ACCOUNT_REBALANCE_INTERVAL}个交易日"
+    )
+    planned_rebalance_label = "每个交易日1个"
+    transfer_label = "无；各账户独立复利并保留自己的现金"
     parameter_rows = [
         ["基本信息", "执行价格", execution_label],
         ["基准设置", "基准名称", benchmark.name],
         ["基准设置", "基准代码", benchmark.code],
+        ["基准设置", "基准累计净值", "基准当日收盘价÷回测首日前一基准交易日收盘价"],
+        ["基准设置", "净值图起点", INITIAL_NAV],
         ["基准设置", "超额净值", "策略累计净值÷基准累计净值；共同起点为1"],
         ["趋势策略", "聚类相关性阈值", CLUSTER_CORRELATION_THRESHOLD],
         ["趋势策略", "趋势因子窗口", TREND_WINDOW],
         ["趋势策略", "排名得分公式", SCORE_LABELS[score_method]],
+        [
+            "趋势策略",
+            "得分计算式",
+            "R_N × R²" if score_method == "return_r2" else "R_N ÷ σ_N",
+        ],
+        ["因子定义", "计算价格", "代表指数收盘价"],
+        ["因子定义", "窗口价格个数 N", TREND_WINDOW],
+        ["因子定义", "窗口日收益个数", TREND_WINDOW - 1],
+        ["因子定义", "窗口收益率 R_N", "窗口末收盘价÷窗口首收盘价−1"],
+        [
+            "因子定义",
+            "R²定义" if score_method == "return_r2" else "窗口波动率 σ_N",
+            (
+                "log(指数收盘价)对时间的含截距OLS拟合优度；不以回归斜率代替收益率"
+                if score_method == "return_r2"
+                else f"简单日收益样本标准差(ddof=1) × √{TREND_WINDOW - 1}；非年化波动"
+            ),
+        ],
         ["趋势策略", "调仓日入选比例", TOP_PERCENT],
-        ["趋势过滤", "过滤位置", "排名后"],
-        ["趋势过滤", "过滤条件", "当前趋势窗口收益率>0"],
-        ["趋势过滤", "未通过处理", "不向后补选，空缺权重留现金"],
+        ["趋势过滤", "过滤位置", "排名前；先过滤全池，再对合格指数按趋势得分排序"],
+        ["趋势过滤", "入选数量", "ceil(过滤后合格指数数×入选比例)；合格池为空时为0"],
+        ["趋势过滤", "正收益限制", "无；按原趋势得分排名，允许窗口收益率为零或负数"],
+        ["趋势过滤", "未通过处理", "不参与趋势排名；入选并匹配的ETF等权，无候选时当天调仓账户空仓"],
+        ["波动过滤", "是否启用", "是" if VOL_FILTER_ENABLED else "否"],
+        ["波动过滤", "日收益窗口 L", VOL_RETURN_DAYS],
+        ["波动过滤", "价格个数", VOL_RETURN_DAYS + 1],
+        ["波动过滤", "过滤波动率公式", "L个简单日收益的样本标准差(ddof=1)；与趋势得分分母独立"],
+        ["波动过滤", "波动率保留比例", VOL_KEEP_TOP_RATIO],
+        ["波动过滤", "波动排名规则", "当日全体有效代表指数波动降序，保留ceil(指数数×比例)；并列按指数代码升序"],
+        ["BIAS过滤", "BIAS模式", BIAS_MODE],
+        ["BIAS过滤", "均线窗口 M", BIAS_WINDOW],
+        ["BIAS过滤", "BIAS公式", "截至信号日最新指数收盘价÷最近M个收盘价的简单均值−1；均线含最新价格"],
+        ["BIAS过滤", "BIAS下限", BIAS_LOWER if BIAS_MODE in {"lower", "both"} else "未启用"],
+        ["BIAS过滤", "BIAS上限", BIAS_UPPER if BIAS_MODE in {"upper", "both"} else "未启用"],
+        ["BIAS过滤", "通过条件", {
+            "none": "不限制BIAS", "lower": "BIAS ≥ 下限",
+            "upper": "BIAS ≤ 上限", "both": "下限 ≤ BIAS ≤ 上限",
+        }[BIAS_MODE]],
+        ["过滤数据", "价格日期", "只使用不晚于信号日的指数价格；次日VWAP使用原信号日指标"],
+        ["过滤数据", "价格允许滞后（自然日）", MAX_PRICE_STALENESS_CALENDAR_DAYS],
+        ["过滤数据", "缺失历史处理", "启用的过滤指标历史不足或过期时报错；不缩小波动排名分母"],
         ["ETF选择", "代表ETF选择", "跟踪同一指数中当日成交量最大"],
-        ["账户结构", "调仓模式", REBALANCE_MODE],
+        ["账户结构", "调仓模式", "staggered"],
         ["账户结构", "组合结构", account_structure_label],
         ["账户结构", "账户数量", ACCOUNT_COUNT],
         ["账户结构", "每账户初始资金比例", 1.0 / ACCOUNT_COUNT],
@@ -2005,7 +2142,7 @@ def write_backtest_metrics_workbook(
         ["容量参数", "当日成交额使用比例 ρ_amt", CAPACITY_DAILY_AMOUNT_RATIO],
         ["容量参数", "倒序分位 q_desc", CAPACITY_DESCENDING_QUANTILE],
         ["容量参数", "等价升序分位 q_asc", 1.0 - CAPACITY_DESCENDING_QUANTILE],
-        ["组合约束", "指数权重", "按过滤前计划入选数量等权"],
+        ["组合约束", "指数权重", "过滤后成功匹配n只ETF，每只目标权重1/n；n=0时空仓"],
         ["收益口径", "扣费后收益", "买入和卖出均扣除交易成本"],
         ["容量口径", "组合容量", "各持仓ETF容量的5%分位"],
     ]
@@ -2014,6 +2151,9 @@ def write_backtest_metrics_workbook(
     style_worksheet(parameter_sheet, max_width=50)
     percentage_parameters = {
         "调仓日入选比例",
+        "波动率保留比例",
+        "BIAS下限",
+        "BIAS上限",
         "每账户初始资金比例",
         "年化无风险利率 r_f",
         "买入成本 c_buy",
@@ -2030,6 +2170,15 @@ def write_backtest_metrics_workbook(
     parameter_sheet.column_dimensions["A"].width = 18
     parameter_sheet.column_dimensions["B"].width = 40
     parameter_sheet.column_dimensions["C"].width = 52
+    for row_number in range(2, parameter_sheet.max_row + 1):
+        value_cell = parameter_sheet.cell(row=row_number, column=3)
+        if isinstance(value_cell.value, str):
+            value_cell.alignment = Alignment(
+                horizontal="left", vertical="center", wrap_text=True
+            )
+            display_width = sum(2 if ord(char) > 127 else 1 for char in value_cell.value)
+            line_count = max(1, math.ceil(display_width / 48))
+            parameter_sheet.row_dimensions[row_number].height = max(18, line_count * 15)
 
     return save_workbook_atomic(
         workbook,
@@ -2315,6 +2464,7 @@ def write_mode_figures(
     benchmark_records: Sequence[BenchmarkRecord],
     baseline_date: date,
     score_backtest_dir: Path,
+    benchmark_name: str,
 ) -> list[Path]:
     """每种交易模式独立生成图表，不和另一模式叠加。"""
 
@@ -2328,6 +2478,8 @@ def write_mode_figures(
     color = "#1F4E79" if mode == "close" else "#C0504D"
     label = mode_execution_label(mode)
     dates = [record.current_date for record in nav_records]
+    if dates != [record.current_date for record in benchmark_records]:
+        raise ValueError("累计净值图的策略与基准日期必须逐日一致")
     comparison_dates = [baseline_date, *dates]
 
     nav_path = output_dir / f"{mode}_cumulative_nav.png"
@@ -2338,6 +2490,13 @@ def write_mode_figures(
         color=color,
         linewidth=1.5,
         label="ETF趋势策略",
+    )
+    axis.plot(
+        comparison_dates,
+        [INITIAL_NAV, *[INITIAL_NAV * record.nav for record in benchmark_records]],
+        color="#548235",
+        linewidth=1.5,
+        label=benchmark_name,
     )
     axis.set_title(
         f"Plot 1: Cumulative Net Value ({label})",
@@ -2512,15 +2671,7 @@ def validate_mode_outputs(
         if not math.isclose(account_nav_sum, nav_record.nav, abs_tol=2e-12):
             raise RuntimeError(f"{mode}账户校验失败：{current_date}账户净值合计不一致")
         attempted_count = sum(row.rebalance_attempted for row in rows)
-        if REBALANCE_MODE == "rebalance":
-            expected_attempted = int(
-                date_position >= first_rebalance_position
-                and (
-                    date_position - first_rebalance_position
-                ) % ACCOUNT_REBALANCE_INTERVAL == 0
-            )
-        else:
-            expected_attempted = int(date_position >= first_rebalance_position)
+        expected_attempted = int(date_position >= first_rebalance_position)
         if attempted_count != expected_attempted:
             raise RuntimeError(f"{mode}账户校验失败：{current_date}调仓账户数不正确")
 
@@ -2608,6 +2759,10 @@ def validate_mode_outputs(
                 allow_header_only = (
                     filename == f"{mode}_account_details.xlsx"
                     and sheet.title in {"账户持仓", "账户交易"}
+                ) or (
+                    filename == f"{mode}_holdings.xlsx"
+                    and sheet.title == "holdings"
+                    and not holding_records
                 )
                 if (sheet.max_row < 2 and not allow_header_only) or sheet.max_column < 1:
                     raise RuntimeError(f"{filename}/{sheet.title}没有有效数据")
@@ -2629,19 +2784,15 @@ def validate_mode_outputs(
 def main() -> None:
     validate_parameters()
     benchmark = load_benchmark_data()
-    if REBALANCE_MODE == "rebalance":
-        rebalance_description = (
-            f"全组合每 {ACCOUNT_REBALANCE_INTERVAL} 个交易日调仓一次"
-        )
-    else:
-        rebalance_description = (
-            f"初始资金分成 {ACCOUNT_COUNT} 个独立账户，每天轮换1个账户，"
-            f"每账户持有 {ACCOUNT_REBALANCE_INTERVAL} 个交易日"
-        )
+    rebalance_description = (
+        f"初始资金分成 {ACCOUNT_COUNT} 个独立账户，每天轮换1个账户，"
+        f"每账户持有 {ACCOUNT_REBALANCE_INTERVAL} 个交易日"
+    )
     print(
         f"聚类阈值 {CLUSTER_CORRELATION_THRESHOLD:g}，"
-        f"趋势窗口 {TREND_WINDOW}，选择调仓信号日得分前 {TOP_PERCENT:.0%}；"
-        f"排名后过滤窗口收益率不大于 {MIN_WINDOW_RETURN:g} 的指数，"
+        f"趋势窗口 {TREND_WINDOW}，先过滤全池，再选择合格指数得分前 {TOP_PERCENT:.0%}；"
+        f"不限制窗口收益率正负；波动过滤={'开启' if VOL_FILTER_ENABLED else '关闭'}，"
+        f"BIAS模式={BIAS_MODE}；"
         f"{rebalance_description}；"
         "本次依次回测两种得分公式。",
         flush=True,
@@ -2657,7 +2808,6 @@ def main() -> None:
         score_backtest_dir = (
             BACKTEST_DIR
             / score_method
-            / STRATEGY_VARIANT_DIR
             / ACCOUNT_VARIANT_DIR
         )
         print(f"\n开始回测：{score_label}（{score_column}）", flush=True)
@@ -2708,7 +2858,7 @@ def main() -> None:
         print(
             f"共 {len(trading_dates)} 个实际ETF交易日，"
             f"实际涉及 {len(selected_codes)} 只ETF，"
-            f"排名后过滤指数-日期记录 {filtered_count} 条，"
+            f"排名前过滤指数-日期记录 {filtered_count} 条，"
             f"无法映射的指数-日期记录 {unmapped_count} 条。",
             flush=True,
         )
@@ -2750,6 +2900,7 @@ def main() -> None:
                 benchmark_records,
                 baseline_date,
                 score_backtest_dir,
+                benchmark.name,
             )
             validate_mode_outputs(
                 mode,
