@@ -4,7 +4,7 @@
 ETF趋势轮动策略回测。
 
 策略：
-1. 对全体有效代表指数按配置应用高波动和BIAS过滤，不要求窗口收益率为正；
+1. 对全体有效代表指数按配置应用高/低波动和BIAS过滤，不要求窗口收益率为正；
 2. 在过滤后的合格指数池中分别按两种趋势得分降序取前10%，数量向上取整；
 3. 对每个保留指数，在当日所有跟踪该指数且成交量大于0的ETF中，
    选择成交量最大者；成交量相同时依次比较成交额、规模和ETF代码；
@@ -61,12 +61,13 @@ ACCOUNT_REBALANCE_INTERVAL = 7
 ACCOUNT_COUNT = ACCOUNT_REBALANCE_INTERVAL
 # 排名前过滤；关闭两项即为无过滤对照。上下限为实验初值，非优化结果。
 VOL_FILTER_ENABLED = True
+VOL_FILTER_MODE = "high"  # high：保留高波动；low：保留低波动。
 VOL_RETURN_DAYS = 20  # 日收益个数，使用21个收盘价；独立于趋势窗口。
-VOL_KEEP_TOP_RATIO = 0.50
+VOL_KEEP_TOP_RATIO = 0.80
 BIAS_MODE = "upper"  # none / lower / upper / both
 BIAS_WINDOW = 20  # 均线使用的收盘价个数，包含信号当日。
 BIAS_LOWER = -0.05  # lower、both：BIAS >= 下限。
-BIAS_UPPER = +0.50  # upper、both：BIAS <= 上限。
+BIAS_UPPER = +0.10  # upper、both：BIAS <= 上限。
 # 与趋势因子计算的历史价格有效期保持一致。
 MAX_PRICE_STALENESS_CALENDAR_DAYS = 7
 ACCOUNT_VARIANT_DIR = f"staggered_{ACCOUNT_REBALANCE_INTERVAL}d"
@@ -545,6 +546,8 @@ def validate_parameters() -> None:
         raise ValueError("错峰账户数必须等于ACCOUNT_REBALANCE_INTERVAL")
     if not isinstance(VOL_FILTER_ENABLED, bool):
         raise ValueError("VOL_FILTER_ENABLED必须是布尔值")
+    if VOL_FILTER_MODE not in {"high", "low"}:
+        raise ValueError("VOL_FILTER_MODE只能设为high或low")
     if not isinstance(VOL_RETURN_DAYS, int) or VOL_RETURN_DAYS < 2:
         raise ValueError("VOL_RETURN_DAYS必须是至少2的整数")
     if not 0 < VOL_KEEP_TOP_RATIO <= 1:
@@ -651,15 +654,23 @@ def filter_eligible_members(
         if needs_bias:
             bias_prices = prices[end - BIAS_WINDOW : end]
             biases[member.index_code] = prices[end - 1] / statistics.mean(bias_prices) - 1.0
-    high_vol_codes: set[str] = set()
+    kept_vol_codes: set[str] = set()
     if VOL_FILTER_ENABLED:
         keep_count = math.ceil(len(members) * VOL_KEEP_TOP_RATIO)
-        high_vol_codes = set(
-            sorted(volatilities, key=lambda code: (-volatilities[code], code))[:keep_count]
+        kept_vol_codes = set(
+            sorted(
+                volatilities,
+                key=lambda code: (
+                    -volatilities[code]
+                    if VOL_FILTER_MODE == "high"
+                    else volatilities[code],
+                    code,
+                ),
+            )[:keep_count]
         )
     return tuple(
         member for member in members
-        if (not VOL_FILTER_ENABLED or member.index_code in high_vol_codes)
+        if (not VOL_FILTER_ENABLED or member.index_code in kept_vol_codes)
         and (BIAS_MODE == "none" or passes_bias_filter(biases[member.index_code]))
     )
 
@@ -2109,11 +2120,28 @@ def write_backtest_metrics_workbook(
         ["趋势过滤", "正收益限制", "无；按原趋势得分排名，允许窗口收益率为零或负数"],
         ["趋势过滤", "未通过处理", "不参与趋势排名；入选并匹配的ETF等权，无候选时当天调仓账户空仓"],
         ["波动过滤", "是否启用", "是" if VOL_FILTER_ENABLED else "否"],
+        [
+            "波动过滤",
+            "过滤模式",
+            (
+                "保留高波动（high）"
+                if VOL_FILTER_MODE == "high"
+                else "保留低波动（low）"
+            ) if VOL_FILTER_ENABLED else "未启用",
+        ],
         ["波动过滤", "日收益窗口 L", VOL_RETURN_DAYS],
         ["波动过滤", "价格个数", VOL_RETURN_DAYS + 1],
         ["波动过滤", "过滤波动率公式", "L个简单日收益的样本标准差(ddof=1)；与趋势得分分母独立"],
         ["波动过滤", "波动率保留比例", VOL_KEEP_TOP_RATIO],
-        ["波动过滤", "波动排名规则", "当日全体有效代表指数波动降序，保留ceil(指数数×比例)；并列按指数代码升序"],
+        [
+            "波动过滤",
+            "波动排名规则",
+            (
+                "当日全体有效代表指数波动降序，保留ceil(指数数×比例)；并列按指数代码升序"
+                if VOL_FILTER_MODE == "high"
+                else "当日全体有效代表指数波动升序，保留ceil(指数数×比例)；并列按指数代码升序"
+            ),
+        ],
         ["BIAS过滤", "BIAS模式", BIAS_MODE],
         ["BIAS过滤", "均线窗口 M", BIAS_WINDOW],
         ["BIAS过滤", "BIAS公式", "截至信号日最新指数收盘价÷最近M个收盘价的简单均值−1；均线含最新价格"],
@@ -2788,10 +2816,19 @@ def main() -> None:
         f"初始资金分成 {ACCOUNT_COUNT} 个独立账户，每天轮换1个账户，"
         f"每账户持有 {ACCOUNT_REBALANCE_INTERVAL} 个交易日"
     )
+    volatility_filter_description = (
+        "关闭"
+        if not VOL_FILTER_ENABLED
+        else (
+            f"{VOL_FILTER_MODE}（保留"
+            f"{'高' if VOL_FILTER_MODE == 'high' else '低'}波动"
+            f"{VOL_KEEP_TOP_RATIO:.0%}）"
+        )
+    )
     print(
         f"聚类阈值 {CLUSTER_CORRELATION_THRESHOLD:g}，"
         f"趋势窗口 {TREND_WINDOW}，先过滤全池，再选择合格指数得分前 {TOP_PERCENT:.0%}；"
-        f"不限制窗口收益率正负；波动过滤={'开启' if VOL_FILTER_ENABLED else '关闭'}，"
+        f"不限制窗口收益率正负；波动过滤={volatility_filter_description}，"
         f"BIAS模式={BIAS_MODE}；"
         f"{rebalance_description}；"
         "本次依次回测两种得分公式。",
