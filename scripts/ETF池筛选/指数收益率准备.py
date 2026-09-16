@@ -1,28 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-按月下载初筛ETF对应指数的历史收盘价，并计算60个共同交易区间收益率。
+按日下载初筛ETF对应指数的历史收盘价，并计算60个共同交易区间收益率。
 
 本脚本只负责聚类前的数据准备，不计算相关矩阵，也不执行层次聚类。
 
 数据来源：
-- 从 outputs/etf_pool/initial 读取每月ETF初筛结果；
+- 从 outputs/etf_pool/initial 读取每日ETF初筛结果；
 - 指数收盘价优先使用 iFinD 的 cmd_history_quotation；
 - iFinD失败或数据不足时，仅对参数区明确配置的同一指数使用AKShare回退；
 - 唯一下载指标为 close；
-- 每月先找出全部指数共有的最近61个收盘日期；
+- 每日先找出当日全部指数共有的最近61个收盘日期；
 - 日收益率 = 本共同日期收盘价 / 上一共同日期收盘价 - 1。
 
 输出：
 - outputs/etf_pool/index_returns/window_60/YYYY_MM_DD.csv；
-- 每个月最后一个实际交易日对应一个独立CSV；
+- 每个交易日对应一个独立CSV；
 - 每个指数使用完全相同的61个共同收盘日期计算60个收益率；
-- 不会把不同月份的数据合并成一张总表。
+- 不会把不同交易日的数据合并成一张总表；
+- 为保持原有输出格式不变，首列仍命名为“月末交易日”，
+  其中填写当前筛选交易日。
 
 断点规则：
-- 已存在且结构完整的月度CSV直接跳过，不调用 cmd_history_quotation；
-- 输出不完整或当月指数池发生变化时，重新下载并原子覆盖该月CSV；
-- 同一次运行内，同一指数的重叠月份区间只请求一次。
+- 已存在且结构完整的日度CSV直接跳过，不调用 cmd_history_quotation；
+- 输出不完整或当日指数池发生变化时，重新下载并原子覆盖当日CSV；
+- 同一次运行内，同一指数的重叠日期区间只请求一次。
 """
 
 from __future__ import annotations
@@ -59,9 +61,9 @@ MAX_LOOKBACK_CALENDAR_DAYS = 730
 # 每次只请求之前没有覆盖的日期区间。
 LOOKBACK_CALENDAR_DAY_STEPS = (180, 240, 300, 365, 540, 730)
 
-# False：完整的月度输出直接跳过，避免重复调用历史行情接口。
-# True：忽略已有月度输出并重新下载、覆盖全部月份。
-OVERWRITE_EXISTING_MONTHS = False
+# False：完整的日度输出直接跳过，避免重复调用历史行情接口。
+# True：忽略已有日度输出并重新下载、覆盖全部交易日。
+OVERWRITE_EXISTING_DAYS = False
 
 # iFinD无法取得某个指数时使用AKShare的同一指数数据。
 # 每项格式：iFinD代码: (AKShare接口名, AKShare标的, 日期列, 收盘价列)
@@ -242,7 +244,7 @@ def month_output_is_complete(month: MonthInput) -> bool:
     """只有全部指数具有相同的60个收益日期时才跳过。"""
 
     path = month.output_file
-    if OVERWRITE_EXISTING_MONTHS or not path.exists():
+    if OVERWRITE_EXISTING_DAYS or not path.exists():
         return False
 
     rows_by_code: dict[str, list[tuple[date, float, float]]] = defaultdict(list)
@@ -783,12 +785,12 @@ def main() -> None:
             pending_months.append(month)
 
     print(
-        f"发现 {len(months)} 个月度指数池，其中 "
-        f"{len(pending_months)} 个月需要下载或重建",
+        f"发现 {len(months)} 个日度指数池，其中 "
+        f"{len(pending_months)} 个交易日需要下载或重建",
         flush=True,
     )
     if not pending_months:
-        print(f"全部月度指数数据已存在：{OUTPUT_DIR}", flush=True)
+        print(f"全部日度指数数据已存在：{OUTPUT_DIR}", flush=True)
         return
 
     downloader = load_etf_downloader_module()
@@ -838,12 +840,12 @@ def main() -> None:
         )
 
     print(
-        f"完成：本次写入 {written_count} 个月度CSV，输出目录：{OUTPUT_DIR}",
+        f"完成：本次写入 {written_count} 个日度CSV，输出目录：{OUTPUT_DIR}",
         flush=True,
     )
     if failed_months:
         raise RuntimeError(
-            f"仍有 {len(failed_months)} 个月度文件因共同收盘日期不足而未输出；"
+            f"仍有 {len(failed_months)} 个日度文件因共同收盘日期不足而未输出；"
             "查看上方日志中的具体指数代码。"
         )
 
