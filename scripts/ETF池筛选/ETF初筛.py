@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-按月筛选ETF池，并按对标指数或 benchmark 去重。
+按日筛选ETF池，并按对标指数或 benchmark 去重。
 
 筛选规则：
-1. 截至当月最后一个交易日，ETF上市满1年；
+1. 截至当日，ETF上市满1年；
 2. 当日基金规模 > 1亿元；
 3. 包含当日在内的过去20个市场交易日平均成交额 > 2000万元；
 4. 对标指数代码不能为空，缺失的ETF在去重前排除；
@@ -14,8 +14,9 @@
 - 只筛选 SELECTED_MAJOR_CATEGORIES 参数指定的ETF大类；
 - 停牌日或成交额空值按0计入20日平均成交额，分母固定为20；
 - 每次运行都会清理输出目录中已有的CSV，再生成本次结果；
-- CSV文件名使用该月最后一个实际交易日，例如2021年1月使用2021_01_29.csv；
-- CSV中的“日期”仍保留该月最后一个实际交易日；
+- 每个满足20日成交额回看要求的交易日生成一个CSV；
+- CSV文件名使用当日交易日期，例如2021年1月29日使用2021_01_29.csv；
+- CSV中的“日期”仍保留当日交易日期；
 - 输出列与 etf_data.csv 完全一致，包含“对标指数代码”；
 - 对标指数代码用于排除缺失ETF，但不作为归类依据。
 """
@@ -25,11 +26,12 @@ from __future__ import annotations
 import calendar
 import csv
 from bisect import bisect_right
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import date, datetime
+from itertools import groupby
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Iterator, Mapping, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -63,18 +65,15 @@ REQUIRED_COLUMNS = {
 
 
 @dataclass(frozen=True)
-class MonthPlan:
-    """一个自然月对应的实际筛选日和20个交易日窗口。"""
+class DailyPlan:
+    """一个交易日对应的筛选日和20个交易日窗口。"""
 
-    year: int
-    month: int
-    file_date: date
     selection_date: date
     turnover_dates: tuple[date, ...]
 
     @property
-    def key(self) -> tuple[int, int]:
-        return self.year, self.month
+    def key(self) -> date:
+        return self.selection_date
 
     @property
     def file_name(self) -> str:
@@ -189,110 +188,111 @@ def inspect_input_dates(path: Path) -> tuple[list[str], list[date]]:
     return fieldnames, sorted(available_dates)
 
 
-def build_month_plans(available_dates: Sequence[date]) -> list[MonthPlan]:
+def build_daily_plans(available_dates: Sequence[date]) -> list[DailyPlan]:
     latest_available_date = available_dates[-1]
-    configured_end = (END_YEAR, END_MONTH)
-    available_end = (
-        latest_available_date.year,
-        latest_available_date.month,
+    configured_start_date = date(START_YEAR, 1, 1)
+    configured_end_date = date(
+        END_YEAR,
+        END_MONTH,
+        calendar.monthrange(END_YEAR, END_MONTH)[1],
     )
-    effective_end_year, effective_end_month = min(
-        configured_end,
-        available_end,
-    )
-    if (START_YEAR, 1) > (effective_end_year, effective_end_month):
+    effective_end_date = min(configured_end_date, latest_available_date)
+    if configured_start_date > effective_end_date:
         raise ValueError(
             f"ETF数据最晚只到{latest_available_date}，"
             f"无法从{START_YEAR}年开始筛选"
         )
 
-    plans: list[MonthPlan] = []
-    for year in range(START_YEAR, effective_end_year + 1):
-        last_month = effective_end_month if year == effective_end_year else 12
-        for month in range(1, last_month + 1):
-            file_date = date(year, month, calendar.monthrange(year, month)[1])
-            month_dates = [
-                current_date
-                for current_date in available_dates
-                if current_date.year == year and current_date.month == month
+    plans: list[DailyPlan] = []
+    for selection_date in available_dates:
+        if not configured_start_date <= selection_date <= effective_end_date:
+            continue
+        selection_position = bisect_right(available_dates, selection_date)
+        turnover_dates = tuple(
+            available_dates[
+                selection_position - TURNOVER_LOOKBACK_DAYS : selection_position
             ]
-            if not month_dates:
-                raise ValueError(f"{year}年{month}月没有可用交易日数据")
-
-            selection_date = month_dates[-1]
-            selection_position = bisect_right(
-                available_dates,
-                selection_date,
+        )
+        if len(turnover_dates) != TURNOVER_LOOKBACK_DAYS:
+            continue
+        plans.append(
+            DailyPlan(
+                selection_date=selection_date,
+                turnover_dates=turnover_dates,
             )
-            turnover_dates = tuple(
-                available_dates[
-                    selection_position - TURNOVER_LOOKBACK_DAYS : selection_position
-                ]
-            )
-            if len(turnover_dates) != TURNOVER_LOOKBACK_DAYS:
-                raise ValueError(
-                    f"{selection_date}之前不足{TURNOVER_LOOKBACK_DAYS}个交易日"
-                )
-
-            plans.append(
-                MonthPlan(
-                    year=year,
-                    month=month,
-                    file_date=file_date,
-                    selection_date=selection_date,
-                    turnover_dates=turnover_dates,
-                )
-            )
+        )
+    if not plans:
+        raise ValueError(
+            f"{configured_start_date}至{effective_end_date}之间没有满足"
+            f"{TURNOVER_LOOKBACK_DAYS}日成交额回看要求的交易日"
+        )
     return plans
 
 
-def collect_month_data(
+def iter_daily_data(
     path: Path,
-    plans: Sequence[MonthPlan],
-) -> tuple[
-    dict[tuple[int, int], dict[str, dict[str, str]]],
-    dict[tuple[int, int], dict[str, float]],
+    plans: Sequence[DailyPlan],
+) -> Iterator[
+    tuple[DailyPlan, dict[str, dict[str, str]], Mapping[str, float]]
 ]:
-    """第二遍读取CSV，只保留60个月末截面和对应的成交额合计。"""
+    """按日期流式读取CSV，并维护包含当日的20日成交额滚动合计。"""
 
-    date_to_turnover_months: dict[date, list[tuple[int, int]]] = defaultdict(list)
-    selection_date_to_month: dict[date, tuple[int, int]] = {}
-    for plan in plans:
-        selection_date_to_month[plan.selection_date] = plan.key
-        for turnover_date in plan.turnover_dates:
-            date_to_turnover_months[turnover_date].append(plan.key)
-
-    snapshots: dict[tuple[int, int], dict[str, dict[str, str]]] = {
-        plan.key: {} for plan in plans
-    }
-    amount_sums: dict[tuple[int, int], dict[str, float]] = {
-        plan.key: defaultdict(float) for plan in plans
-    }
+    plans_by_date = {plan.selection_date: plan for plan in plans}
+    first_plan_date = plans[0].selection_date
+    last_plan_date = plans[-1].selection_date
+    amount_window: deque[dict[str, float]] = deque()
+    rolling_amount_sums: dict[str, float] = defaultdict(float)
+    previous_date: date | None = None
 
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
-        for row in reader:
-            if not selected_major_category(row.get("类别大类")):
+        for current_date, date_rows in groupby(
+            reader,
+            key=lambda row: parse_date(row.get("日期"), "日期"),
+        ):
+            if previous_date is not None and current_date <= previous_date:
+                raise ValueError(
+                    "etf_data.csv 必须按日期严格升序排列，"
+                    f"但 {current_date} 出现在 {previous_date} 之后"
+                )
+            previous_date = current_date
+
+            snapshot: dict[str, dict[str, str]] = {}
+            daily_amounts: dict[str, float] = defaultdict(float)
+            for row in date_rows:
+                if not selected_major_category(row.get("类别大类")):
+                    continue
+                code = clean_text(row.get("代码"))
+                if not code:
+                    continue
+                snapshot[code] = dict(row)
+                # 空成交额（包括停牌日）按0处理，只累计有效数字。
+                daily_amounts[code] += parse_number(row.get("成交额")) or 0.0
+
+            amount_window.append(dict(daily_amounts))
+            for code, amount in daily_amounts.items():
+                rolling_amount_sums[code] += amount
+            if len(amount_window) > TURNOVER_LOOKBACK_DAYS:
+                expired_amounts = amount_window.popleft()
+                for code, amount in expired_amounts.items():
+                    rolling_amount_sums[code] -= amount
+
+            if current_date < first_plan_date:
                 continue
-            code = clean_text(row.get("代码"))
-            if not code:
+            if current_date > last_plan_date:
+                break
+            plan = plans_by_date.get(current_date)
+            if plan is None:
                 continue
-            current_date = parse_date(row.get("日期"), "日期")
-
-            # 空成交额（包括停牌日）按0处理，因此只累计有效数字即可。
-            amount = parse_number(row.get("成交额")) or 0.0
-            for month_key in date_to_turnover_months.get(current_date, ()):
-                amount_sums[month_key][code] += amount
-
-            month_key = selection_date_to_month.get(current_date)
-            if month_key is not None:
-                snapshots[month_key][code] = dict(row)
-
-    return snapshots, amount_sums
+            if len(amount_window) != TURNOVER_LOOKBACK_DAYS:
+                raise RuntimeError(
+                    f"{current_date}没有完整的{TURNOVER_LOOKBACK_DAYS}日成交额窗口"
+                )
+            yield plan, snapshot, rolling_amount_sums
 
 
 def base_filter_candidates(
-    plan: MonthPlan,
+    plan: DailyPlan,
     snapshot: Mapping[str, Mapping[str, str]],
     amount_sums: Mapping[str, float],
 ) -> list[Candidate]:
@@ -357,7 +357,7 @@ def deduplicate_by_benchmark(
     return sorted(winners, key=lambda candidate: candidate.code)
 
 
-def write_month_file(
+def write_daily_file(
     path: Path,
     fieldnames: Sequence[str],
     candidates: Iterable[Candidate],
@@ -376,7 +376,7 @@ def write_month_file(
 
 
 def clear_previous_csv_outputs() -> int:
-    """删除输出目录第一层已有的CSV，避免保留旧命名或旧月份结果。"""
+    """删除输出目录第一层已有的CSV，避免保留旧结果。"""
 
     old_files = sorted(path for path in OUTPUT_DIR.glob("*.csv") if path.is_file())
     for path in old_files:
@@ -400,30 +400,35 @@ def main() -> None:
         flush=True,
     )
     fieldnames, available_dates = inspect_input_dates(INPUT_FILE)
-    plans = build_month_plans(available_dates)
-    snapshots, amount_sums = collect_month_data(INPUT_FILE, plans)
+    plans = build_daily_plans(available_dates)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     removed_count = clear_previous_csv_outputs()
     if removed_count:
         print(f"已清理旧的初筛CSV：{removed_count} 个", flush=True)
-    for plan in plans:
+    written_count = 0
+    for plan, snapshot, amount_sums in iter_daily_data(INPUT_FILE, plans):
         candidates = base_filter_candidates(
             plan,
-            snapshots[plan.key],
-            amount_sums[plan.key],
+            snapshot,
+            amount_sums,
         )
         selected = deduplicate_by_benchmark(candidates)
         output_path = OUTPUT_DIR / plan.file_name
-        selected_count = write_month_file(output_path, fieldnames, selected)
+        selected_count = write_daily_file(output_path, fieldnames, selected)
+        written_count += 1
         print(
-            f"{plan.year}-{plan.month:02d}：筛选日 {plan.selection_date}，"
+            f"筛选日 {plan.selection_date}："
             f"基础条件通过 {len(candidates)} 只，基准去重后 {selected_count} 只，"
             f"已保存到 {output_path}",
             flush=True,
         )
 
     expected_count = len(plans)
+    if written_count != expected_count:
+        raise RuntimeError(
+            f"计划生成 {expected_count} 个CSV，实际只生成 {written_count} 个"
+        )
     print(
         f"完成：共生成 {expected_count} 个CSV文件，输出目录：{OUTPUT_DIR}",
         flush=True,
