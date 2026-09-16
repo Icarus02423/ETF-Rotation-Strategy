@@ -105,7 +105,7 @@ BACKTEST_DIR = (
     / "outputs"
     / "etf_trend_strategy"
     / f"threshold_{CLUSTER_CORRELATION_THRESHOLD:g}"
-    / "threshold_0.9"
+    / "backtest"
     / f"window_{TREND_WINDOW}"
 )
 
