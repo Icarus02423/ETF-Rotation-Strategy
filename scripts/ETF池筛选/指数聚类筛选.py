@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-按月对ETF对应指数进行收益来源去重，生成每月底动态指数池。
+按日对ETF对应指数进行收益来源去重，生成每日动态指数池。
 
 处理逻辑：
-1. 读取每月ETF初筛结果及对应指数60个共同交易区间收益率；
+1. 读取每日ETF初筛结果及对应指数60个共同交易区间收益率；
 2. 检查全部指数的60个收益日期完全一致，计算指数收益率相关矩阵；
 3. 将相关矩阵转换为距离矩阵：Distance = 1 - Corr；
 4. 使用complete linkage层次聚类，阈值由参数区设定；
@@ -17,9 +17,11 @@
 
 输出：
 - outputs/etf_pool/clusters/threshold_<相关性阈值>/reports/YYYY_MM_DD.xlsx
-- 每个工作簿的第一张表为月底动态指数池；
+- 每个工作簿的第一张表为当日动态指数池；
 - 第二张表为代表筛选前所有原始指数的完整相关性矩阵。
 - 第三张表为每个聚类的全部成员、代表ETF及聚类内相关性。
+- 为保持原有输入格式不变，指数收益率CSV首列仍使用“月末交易日”，
+  其中填写当前筛选交易日。
 """
 
 from __future__ import annotations
@@ -105,7 +107,7 @@ CLUSTER_DETAIL_COLUMNS = [
 ]
 @dataclass(frozen=True)
 class MonthInput:
-    """一个月末的ETF初筛数据和指数收益率文件。"""
+    """一个筛选交易日的ETF初筛数据和指数收益率文件。"""
 
     selection_date: date
     initial_file: Path
@@ -285,7 +287,7 @@ def calculate_average_turnover(
         for turnover_date in turnover_dates:
             months_by_turnover_date[turnover_date].append(file_name)
 
-    # 保留到“月份 + ETF + 日期”级别，避免源文件意外重复行被重复累加。
+    # 保留到“筛选日 + ETF + 日期”级别，避免源文件意外重复行被重复累加。
     amounts: dict[str, dict[str, dict[date, float]]] = {
         month.file_name: defaultdict(dict) for month in months
     }
@@ -1012,7 +1014,7 @@ def main() -> None:
     validate_parameters()
     fieldnames, months = discover_month_inputs()
     print(
-        f"发现 {len(months)} 个月度ETF初筛池；"
+        f"发现 {len(months)} 个日度ETF初筛池；"
         f"相关性阈值 {CORRELATION_THRESHOLD:g}，"
         f"距离阈值 {1.0 - CORRELATION_THRESHOLD:g}，"
         "聚类方法 complete linkage",
@@ -1081,7 +1083,7 @@ def main() -> None:
         print(f"已清理 {removed_count} 个旧聚类输出文件", flush=True)
 
     print(
-        f"完成：共生成 {len(months)} 个月底XLSX，"
+        f"完成：共生成 {len(months)} 个日度XLSX，"
         "第一张表为动态指数池，第二张表为完整相关性矩阵，"
         "第三张表为聚类明细，"
         f"输出目录：{OUTPUT_DIR}",
