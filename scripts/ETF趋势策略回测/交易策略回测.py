@@ -62,12 +62,12 @@ ACCOUNT_COUNT = ACCOUNT_REBALANCE_INTERVAL
 # 排名前过滤；关闭两项即为无过滤对照。上下限为实验初值，非优化结果。
 VOL_FILTER_ENABLED = True
 VOL_FILTER_MODE = "high"  # high：保留高波动；low：保留低波动。
-VOL_RETURN_DAYS = 20  # 日收益个数，使用21个收盘价；独立于趋势窗口。
-VOL_KEEP_TOP_RATIO = 0.80
+VOL_RETURN_DAYS = 18  # 日收益个数，使用21个收盘价；独立于趋势窗口。
+VOL_KEEP_TOP_RATIO = 0.55
 BIAS_MODE = "upper"  # none / lower / upper / both
-BIAS_WINDOW = 20  # 均线使用的收盘价个数，包含信号当日。
+BIAS_WINDOW = 36  # 均线使用的收盘价个数，包含信号当日。
 BIAS_LOWER = -0.05  # lower、both：BIAS >= 下限。
-BIAS_UPPER = +0.10  # upper、both：BIAS <= 上限。
+BIAS_UPPER = +0.09  # upper、both：BIAS <= 上限。
 # 与趋势因子计算的历史价格有效期保持一致。
 MAX_PRICE_STALENESS_CALENDAR_DAYS = 7
 ACCOUNT_VARIANT_DIR = f"staggered_{ACCOUNT_REBALANCE_INTERVAL}d"
