@@ -40,9 +40,9 @@ TREND_HISTORY_LOOKBACK_CALENDAR_DAYS = 180
 TREND_MAX_LOOKBACK_CALENDAR_DAYS = 730
 TREND_REQUIRED_HISTORY_CLOSES = 61
 
-# False：完整的月度输出直接跳过，避免重复调用历史行情接口。
-# True：忽略已有月度输出并重新下载、覆盖全部月份。
-OVERWRITE_EXISTING_MONTHS = False
+# False：完整的日度输出直接跳过，避免重复调用历史行情接口。
+# True：忽略已有日度输出并重新下载、覆盖全部交易日。
+OVERWRITE_EXISTING_DAYS = False
 # ====================================================================
 
 ALLOWED_CLUSTER_THRESHOLDS = (0.7, 0.8, 0.9)
@@ -144,7 +144,7 @@ def validate_parameters() -> None:
 
 def discover_trend_pool_inputs() -> list[TrendPoolInput]:
     if not CLUSTER_POOL_DIR.exists():
-        raise FileNotFoundError(f"找不到月底动态指数池：{CLUSTER_POOL_DIR}")
+        raise FileNotFoundError(f"找不到日度动态指数池：{CLUSTER_POOL_DIR}")
 
     files = sorted(CLUSTER_POOL_DIR.glob("*.xlsx"))
     if not files:
@@ -201,7 +201,7 @@ def discover_trend_pool_inputs() -> list[TrendPoolInput]:
 
     selection_dates = [selection_date for selection_date, _ in snapshots]
     if len(selection_dates) != len(set(selection_dates)):
-        raise ValueError("动态指数池存在重复月份")
+        raise ValueError("动态指数池存在重复交易日")
 
     pools: list[TrendPoolInput] = []
     for position, (selection_date, index_names) in enumerate(snapshots):
@@ -285,11 +285,6 @@ def output_is_complete(pool: TrendPoolInput) -> bool:
         history_count = sum(price_date <= pool.selection_date for price_date in price_dates)
         if history_count < TREND_REQUIRED_HISTORY_CLOSES:
             return False
-        if pool.end_date > pool.selection_date and not any(
-            pool.selection_date < price_date <= pool.end_date
-            for price_date in price_dates
-        ):
-            return False
     return True
 
 
@@ -333,10 +328,6 @@ def build_output_rows(
         if len(history) < required_raw_closes:
             insufficient_codes.append(index_code)
             continue
-        if pool.end_date > pool.selection_date and not future:
-            insufficient_codes.append(index_code)
-            continue
-
         selected = history[-required_raw_closes:] + future
         for previous, current in zip(selected, selected[1:]):
             price_date, close = current
@@ -367,12 +358,29 @@ def write_output(path: Path, rows: Sequence[Sequence[str]]) -> None:
         raise
 
 
+def remove_stale_outputs(expected_file_names: set[str]) -> int:
+    stale_files = [
+        path
+        for path in OUTPUT_DIR.glob("*.csv")
+        if path.name not in expected_file_names
+    ]
+    for path in stale_files:
+        path.unlink()
+    return len(stale_files)
+
+
 def download_trend_index_data(pools: Sequence[TrendPoolInput]) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    removed_count = remove_stale_outputs(
+        {pool.output_file.name for pool in pools}
+    )
+    if removed_count:
+        print(f"已清理 {removed_count} 个旧代表指数行情文件", flush=True)
+
     pending_pools = [
         pool
         for pool in pools
-        if OVERWRITE_EXISTING_MONTHS or not output_is_complete(pool)
+        if OVERWRITE_EXISTING_DAYS or not output_is_complete(pool)
     ]
     for pool in pools:
         if pool not in pending_pools:
@@ -542,13 +550,13 @@ def download_trend_index_data(pools: Sequence[TrendPoolInput]) -> None:
         )
 
     print(
-        f"代表指数连续行情完成：本次写入 {written_count} 个月度CSV，"
+        f"代表指数连续行情完成：本次写入 {written_count} 个日度CSV，"
         f"输出目录：{OUTPUT_DIR}",
         flush=True,
     )
     if failed_files:
         raise RuntimeError(
-            f"仍有 {len(failed_files)} 个月度代表指数连续行情未保存；"
+            f"仍有 {len(failed_files)} 个日度代表指数连续行情未保存；"
             "查看上方日志中的指数代码。"
         )
 
