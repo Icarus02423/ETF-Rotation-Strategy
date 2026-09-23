@@ -3,7 +3,11 @@
 !.gitignore
 !.gitattributes
 !README.md
+!requirements.txt
 !scripts/
 !scripts/**
 !outputs/
 !outputs/**
+
+**/__pycache__/
+**/*.py[cod]
