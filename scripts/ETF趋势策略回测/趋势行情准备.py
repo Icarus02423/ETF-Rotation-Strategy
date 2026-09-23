@@ -4,11 +4,12 @@
 为各期动态指数池准备趋势因子所需的连续指数行情。
 
 输入：
-- outputs/etf_pool/clusters/threshold_<相关性阈值>/reports/YYYY_MM_DD.xlsx
+- outputs/etf_pool/<更新频率>/clusters/threshold_<相关性阈值>/reports/
+  YYYY_MM_DD.xlsx
   只读取第一张“动态指数池”。
 
 输出：
-- outputs/etf_trend_strategy/threshold_<相关性阈值>/index_prices/
+- outputs/etf_trend_strategy/<更新频率>/threshold_<相关性阈值>/index_prices/
   YYYY_MM_DD.csv
 
 输出CSV的列、内容和生成规则与原聚类脚本中的趋势行情输出完全一致。
@@ -31,36 +32,26 @@ from openpyxl import load_workbook
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from 实验配置 import CORRELATION_THRESHOLDS, UPDATE_FREQUENCIES
+from 输出路径 import cluster_report_dir, index_price_dir
 
 # ============================= 行情参数 =============================
-# 必须与要读取的聚类结果阈值一致，可改为0.7、0.8或0.9。
+# 直接运行本脚本时使用的频率和阈值；总运行器以后会显式传入实验参数。
+UPDATE_FREQUENCY = "daily"
 CLUSTER_CORRELATION_THRESHOLD = 0.9
 
 TREND_HISTORY_LOOKBACK_CALENDAR_DAYS = 180
 TREND_MAX_LOOKBACK_CALENDAR_DAYS = 730
 TREND_REQUIRED_HISTORY_CLOSES = 61
 
-# False：完整的日度输出直接跳过，避免重复调用历史行情接口。
-# True：忽略已有日度输出并重新下载、覆盖全部交易日。
+# False：当前频率下的完整输出直接跳过，避免重复调用历史行情接口。
+# True：忽略已有输出并重新下载、覆盖全部快照。
 OVERWRITE_EXISTING_DAYS = False
 # ====================================================================
 
-ALLOWED_CLUSTER_THRESHOLDS = (0.7, 0.8, 0.9)
-CLUSTER_POOL_DIR = (
-    PROJECT_ROOT
-    / "outputs"
-    / "etf_pool"
-    / "clusters"
-    / f"threshold_{CLUSTER_CORRELATION_THRESHOLD:g}"
-    / "reports"
-)
-OUTPUT_DIR = (
-    PROJECT_ROOT
-    / "outputs"
-    / "etf_trend_strategy"
-    / f"threshold_{CLUSTER_CORRELATION_THRESHOLD:g}"
-    / "index_prices"
-)
 INDEX_DOWNLOADER_SCRIPT = (
     PROJECT_ROOT / "scripts" / "ETF池筛选" / "指数收益率准备.py"
 )
@@ -84,10 +75,7 @@ class TrendPoolInput:
     selection_date: date
     end_date: date
     index_names: Mapping[str, str]
-
-    @property
-    def output_file(self) -> Path:
-        return OUTPUT_DIR / self.selection_date.strftime("%Y_%m_%d.csv")
+    output_file: Path
 
 
 def clean_text(value: object) -> str:
@@ -122,14 +110,21 @@ def parse_finite_number(value: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def validate_parameters() -> None:
+def validate_parameters(
+    update_frequency: str,
+    correlation_threshold: float,
+) -> None:
+    if update_frequency not in UPDATE_FREQUENCIES:
+        raise ValueError(
+            f"UPDATE_FREQUENCY只能是：{', '.join(UPDATE_FREQUENCIES)}"
+        )
     if not any(
         math.isclose(
-            CLUSTER_CORRELATION_THRESHOLD,
+            correlation_threshold,
             allowed,
             abs_tol=1e-12,
         )
-        for allowed in ALLOWED_CLUSTER_THRESHOLDS
+        for allowed in CORRELATION_THRESHOLDS
     ):
         raise ValueError(
             "CLUSTER_CORRELATION_THRESHOLD只能设为0.7、0.8或0.9"
@@ -142,13 +137,20 @@ def validate_parameters() -> None:
         raise ValueError("趋势行情最大回溯天数不能小于初始回溯天数")
 
 
-def discover_trend_pool_inputs() -> list[TrendPoolInput]:
-    if not CLUSTER_POOL_DIR.exists():
-        raise FileNotFoundError(f"找不到日度动态指数池：{CLUSTER_POOL_DIR}")
+def discover_trend_pool_inputs(
+    cluster_pool_directory: Path,
+    output_directory: Path,
+) -> list[TrendPoolInput]:
+    if not cluster_pool_directory.exists():
+        raise FileNotFoundError(
+            f"找不到动态指数池：{cluster_pool_directory}"
+        )
 
-    files = sorted(CLUSTER_POOL_DIR.glob("*.xlsx"))
+    files = sorted(cluster_pool_directory.glob("*.xlsx"))
     if not files:
-        raise FileNotFoundError(f"动态指数池目录没有XLSX：{CLUSTER_POOL_DIR}")
+        raise FileNotFoundError(
+            f"动态指数池目录没有XLSX：{cluster_pool_directory}"
+        )
 
     snapshots: list[tuple[date, dict[str, str]]] = []
     for path in files:
@@ -215,6 +217,10 @@ def discover_trend_pool_inputs() -> list[TrendPoolInput]:
                 selection_date=selection_date,
                 end_date=end_date,
                 index_names=index_names,
+                output_file=(
+                    output_directory
+                    / selection_date.strftime("%Y_%m_%d.csv")
+                ),
             )
         )
     return pools
@@ -358,10 +364,13 @@ def write_output(path: Path, rows: Sequence[Sequence[str]]) -> None:
         raise
 
 
-def remove_stale_outputs(expected_file_names: set[str]) -> int:
+def remove_stale_outputs(
+    output_directory: Path,
+    expected_file_names: set[str],
+) -> int:
     stale_files = [
         path
-        for path in OUTPUT_DIR.glob("*.csv")
+        for path in output_directory.glob("*.csv")
         if path.name not in expected_file_names
     ]
     for path in stale_files:
@@ -369,9 +378,13 @@ def remove_stale_outputs(expected_file_names: set[str]) -> int:
     return len(stale_files)
 
 
-def download_trend_index_data(pools: Sequence[TrendPoolInput]) -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def download_trend_index_data(
+    pools: Sequence[TrendPoolInput],
+    output_directory: Path,
+) -> None:
+    output_directory.mkdir(parents=True, exist_ok=True)
     removed_count = remove_stale_outputs(
+        output_directory,
         {pool.output_file.name for pool in pools}
     )
     if removed_count:
@@ -389,7 +402,10 @@ def download_trend_index_data(pools: Sequence[TrendPoolInput]) -> None:
                 flush=True,
             )
     if not pending_pools:
-        print(f"全部代表指数连续行情已存在：{OUTPUT_DIR}", flush=True)
+        print(
+            f"全部代表指数连续行情已存在：{output_directory}",
+            flush=True,
+        )
         return
 
     index_module = load_index_downloader_module()
@@ -550,26 +566,41 @@ def download_trend_index_data(pools: Sequence[TrendPoolInput]) -> None:
         )
 
     print(
-        f"代表指数连续行情完成：本次写入 {written_count} 个日度CSV，"
-        f"输出目录：{OUTPUT_DIR}",
+        f"代表指数连续行情完成：本次写入 {written_count} 个CSV，"
+        f"输出目录：{output_directory}",
         flush=True,
     )
     if failed_files:
         raise RuntimeError(
-            f"仍有 {len(failed_files)} 个日度代表指数连续行情未保存；"
+            f"仍有 {len(failed_files)} 个代表指数连续行情未保存；"
             "查看上方日志中的指数代码。"
         )
 
 
-def main() -> None:
-    validate_parameters()
-    pools = discover_trend_pool_inputs()
+def main(
+    update_frequency: str = UPDATE_FREQUENCY,
+    correlation_threshold: float = CLUSTER_CORRELATION_THRESHOLD,
+) -> None:
+    validate_parameters(update_frequency, correlation_threshold)
+    cluster_pool_directory = cluster_report_dir(
+        update_frequency,
+        correlation_threshold,
+    )
+    output_directory = index_price_dir(
+        update_frequency,
+        correlation_threshold,
+    )
+    pools = discover_trend_pool_inputs(
+        cluster_pool_directory,
+        output_directory,
+    )
     print(
-        f"聚类阈值 {CLUSTER_CORRELATION_THRESHOLD:g}，"
+        f"更新频率 {update_frequency}，"
+        f"聚类阈值 {correlation_threshold:g}，"
         f"共 {len(pools)} 期动态指数池。",
         flush=True,
     )
-    download_trend_index_data(pools)
+    download_trend_index_data(pools, output_directory)
 
 
 if __name__ == "__main__":
