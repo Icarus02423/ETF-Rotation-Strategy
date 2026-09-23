@@ -3,9 +3,10 @@
 """
 BIAS上限过滤参数调优。
 
-仅改变BIAS均线窗口和BIAS上限，其他参数由下方参数区固定。程序复用正式
-交易回测脚本的交易函数，在内存中运行完整参数网格，只输出两个趋势公式、
-两种成交方式对应的四张累计收益率热力图，不生成中间数据文件。
+每次为一个更新频率、过滤状态、聚类阈值、趋势窗口和错峰天数组合，
+遍历BIAS均线窗口与BIAS上限。程序复用正式交易回测的交易函数，
+只输出两个趋势公式、两种成交方式对应的四张累计收益率热力图。
+组合过滤状态使用固定的波动率参数，因此结果是条件最优，不是两类参数的联合最优。
 """
 
 from __future__ import annotations
@@ -33,24 +34,38 @@ from matplotlib.ticker import PercentFormatter
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from 实验配置 import (
+    CORRELATION_THRESHOLDS,
+    FILTER_PROFILE_SETTINGS,
+    STAGGER_DAYS,
+    TREND_WINDOWS,
+    UPDATE_FREQUENCIES,
+)
+from 输出路径 import factor_dir, index_price_dir, tuning_result_dir
+
 BACKTEST_FILE = PROJECT_ROOT / "scripts" / "ETF趋势策略回测" / "交易策略回测.py"
 
 # ============================= 策略基准参数 =============================
+UPDATE_FREQUENCY = "daily"
+FILTER_PROFILE = "bias_only"
 CLUSTER_CORRELATION_THRESHOLD = 0.9
-TREND_WINDOW = 15
+TREND_WINDOW = 20
 BENCHMARK_CODE = "000510.CSI"
 SCORE_METHODS_TO_RUN = ("return_r2", "return_vol")
 TOP_PERCENT = 0.10
-ACCOUNT_REBALANCE_INTERVAL = 4
+ACCOUNT_REBALANCE_INTERVAL = 1
 ACCOUNT_COUNT = ACCOUNT_REBALANCE_INTERVAL
-VOL_FILTER_ENABLED = True
+VOL_FILTER_ENABLED = False
 VOL_FILTER_MODE = "high"
 VOL_RETURN_DAYS = 18
 VOL_KEEP_TOP_RATIO = 0.55
 BIAS_MODE = "upper"
 BIAS_WINDOW = 36
 BIAS_LOWER = -0.05
-BIAS_UPPER = +0.10
+BIAS_UPPER = +0.09
 MAX_PRICE_STALENESS_CALENDAR_DAYS = 7
 ACCOUNT_VARIANT_DIR = f"staggered_{ACCOUNT_REBALANCE_INTERVAL}d"
 TRANSACTION_COST_RATE = 0.001
@@ -69,14 +84,7 @@ BIAS_UPPERS = tuple(value / 100.0 for value in range(0, 31))
 
 SCORE_METHODS = SCORE_METHODS_TO_RUN
 TRADE_MODES = ("close", "next_day_vwap")
-
-OUTPUT_DIR = (
-    PROJECT_ROOT
-    / "outputs"
-    / "parameter_grid"
-    / "bias_parameter_grid"
-    / f"window_{TREND_WINDOW}"
-)
+ALLOWED_FILTER_PROFILES = ("bias_only", "bias_and_volatility")
 
 OUTPUT_FILES = {
     ("return_r2", "close"): "return_r2_close_total_return_heatmap.png",
@@ -84,6 +92,20 @@ OUTPUT_FILES = {
     ("return_vol", "close"): "return_vol_close_total_return_heatmap.png",
     ("return_vol", "next_day_vwap"): "return_vol_next_day_vwap_total_return_heatmap.png",
 }
+
+
+@dataclass(frozen=True)
+class BiasTuningSettings:
+    update_frequency: str
+    filter_profile: str
+    correlation_threshold: float
+    trend_window: int
+    stagger_days: int
+    factor_directory: Path
+    index_price_directory: Path
+    output_directory: Path
+    bias_mode: str
+    vol_filter_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -98,22 +120,99 @@ class MethodContext:
     benchmark_end_date: date
 
 
-def configure_backtest_module(backtest: ModuleType) -> None:
-    """让调优脚本顶部参数成为本次实验实际使用的参数。"""
+def validate_tuning_dimensions(
+    update_frequency: str,
+    filter_profile: str,
+    correlation_threshold: float,
+    trend_window: int,
+    stagger_days: int,
+) -> None:
+    """在计算任何输入输出路径前，先验证公共实验维度。"""
+
+    if update_frequency not in UPDATE_FREQUENCIES:
+        raise ValueError(
+            f"update_frequency只能是：{', '.join(UPDATE_FREQUENCIES)}"
+        )
+    if filter_profile not in ALLOWED_FILTER_PROFILES:
+        raise ValueError(
+            "BIAS参数调优的filter_profile只能是："
+            + "、".join(ALLOWED_FILTER_PROFILES)
+        )
+    if not any(
+        math.isclose(correlation_threshold, allowed, abs_tol=1e-12)
+        for allowed in CORRELATION_THRESHOLDS
+    ):
+        raise ValueError(
+            f"correlation_threshold只能是：{CORRELATION_THRESHOLDS}"
+        )
+    if trend_window not in TREND_WINDOWS:
+        raise ValueError(f"trend_window只能是：{TREND_WINDOWS}")
+    if stagger_days not in STAGGER_DAYS:
+        raise ValueError(f"stagger_days只能是：{STAGGER_DAYS}")
+
+
+def build_tuning_settings(
+    update_frequency: str,
+    filter_profile: str,
+    correlation_threshold: float,
+    trend_window: int,
+    stagger_days: int,
+) -> BiasTuningSettings:
+    validate_tuning_dimensions(
+        update_frequency,
+        filter_profile,
+        correlation_threshold,
+        trend_window,
+        stagger_days,
+    )
+    profile_settings = FILTER_PROFILE_SETTINGS[filter_profile]
+    bias_mode = profile_settings["bias_mode"]
+    vol_filter_enabled = profile_settings["vol_filter_enabled"]
+    if bias_mode != "upper":
+        raise ValueError("BIAS参数调优要求过滤状态启用BIAS上限")
+    if not isinstance(vol_filter_enabled, bool):
+        raise ValueError("过滤状态中的vol_filter_enabled必须是布尔值")
+    return BiasTuningSettings(
+        update_frequency=update_frequency,
+        filter_profile=filter_profile,
+        correlation_threshold=correlation_threshold,
+        trend_window=trend_window,
+        stagger_days=stagger_days,
+        factor_directory=factor_dir(
+            update_frequency,
+            correlation_threshold,
+            trend_window,
+        ),
+        index_price_directory=index_price_dir(
+            update_frequency,
+            correlation_threshold,
+        ),
+        output_directory=tuning_result_dir(
+            update_frequency,
+            filter_profile,
+            "bias_parameter_grid",
+            correlation_threshold,
+            trend_window,
+            stagger_days,
+        ),
+        bias_mode=bias_mode,
+        vol_filter_enabled=vol_filter_enabled,
+    )
+
+
+def configure_backtest_module(
+    backtest: ModuleType,
+    settings: BiasTuningSettings,
+) -> None:
+    """显式把本次调优设置注入隔离加载的正式回测模块。"""
 
     parameter_names = (
-        "CLUSTER_CORRELATION_THRESHOLD",
-        "TREND_WINDOW",
         "BENCHMARK_CODE",
         "SCORE_METHODS_TO_RUN",
         "TOP_PERCENT",
-        "ACCOUNT_REBALANCE_INTERVAL",
-        "ACCOUNT_COUNT",
-        "VOL_FILTER_ENABLED",
         "VOL_FILTER_MODE",
         "VOL_RETURN_DAYS",
         "VOL_KEEP_TOP_RATIO",
-        "BIAS_MODE",
         "BIAS_WINDOW",
         "BIAS_LOWER",
         "BIAS_UPPER",
@@ -129,28 +228,24 @@ def configure_backtest_module(backtest: ModuleType) -> None:
     for name in parameter_names:
         setattr(backtest, name, globals()[name])
 
-    backtest.FACTOR_DIR = (
-        PROJECT_ROOT
-        / "outputs"
-        / "etf_trend_strategy"
-        / f"threshold_{CLUSTER_CORRELATION_THRESHOLD:g}"
-        / "factors"
-        / f"window_{TREND_WINDOW}"
-    )
+    backtest.UPDATE_FREQUENCY = settings.update_frequency
+    backtest.FILTER_PROFILE = settings.filter_profile
+    backtest.CLUSTER_CORRELATION_THRESHOLD = settings.correlation_threshold
+    backtest.TREND_WINDOW = settings.trend_window
+    backtest.ACCOUNT_REBALANCE_INTERVAL = settings.stagger_days
+    backtest.ACCOUNT_COUNT = settings.stagger_days
+    backtest.ACCOUNT_VARIANT_DIR = f"staggered_{settings.stagger_days}d"
+    backtest.BIAS_MODE = settings.bias_mode
+    backtest.VOL_FILTER_ENABLED = settings.vol_filter_enabled
+    backtest.FACTOR_DIR = settings.factor_directory
+    backtest.INDEX_RAW_DATA_DIR = settings.index_price_directory
     backtest.ETF_DATA_FILE = PROJECT_ROOT / "outputs" / "etf_data" / "etf_data.csv"
-    backtest.INDEX_RAW_DATA_DIR = backtest.FACTOR_DIR.parent.parent / "index_prices"
     backtest.BENCHMARK_DIR = PROJECT_ROOT / "outputs" / "benchmark_data"
-    backtest.BACKTEST_DIR = (
-        PROJECT_ROOT
-        / "outputs"
-        / "etf_trend_strategy"
-        / f"threshold_{CLUSTER_CORRELATION_THRESHOLD:g}"
-        / "backtest"
-        / f"window_{TREND_WINDOW}"
-    )
+    # 调优一次计算两个趋势因子，且自己管理输出；不使用正式回测的
+    # TREND_FACTOR、DEFAULT_EXPERIMENT_CASE和BACKTEST_DIR。
 
 
-def load_backtest_module() -> ModuleType:
+def load_backtest_module(settings: BiasTuningSettings) -> ModuleType:
     if not BACKTEST_FILE.exists():
         raise FileNotFoundError(f"找不到正式交易回测脚本：{BACKTEST_FILE}")
     module_name = "etf_trend_backtest_for_bias_tuning"
@@ -160,14 +255,28 @@ def load_backtest_module() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
-    configure_backtest_module(module)
+    configure_backtest_module(module, settings)
     return module
 
 
-def validate_grid(backtest: ModuleType) -> None:
+def validate_grid(
+    backtest: ModuleType,
+    settings: BiasTuningSettings,
+) -> None:
     backtest.validate_parameters()
-    if backtest.BIAS_MODE != "upper":
+    if backtest.BIAS_MODE != settings.bias_mode or backtest.BIAS_MODE != "upper":
         raise ValueError("BIAS参数调优要求正式回测的BIAS_MODE为upper")
+    if backtest.VOL_FILTER_ENABLED is not settings.vol_filter_enabled:
+        raise ValueError("正式回测的波动率过滤开关与本次调优不一致")
+    if backtest.FACTOR_DIR != settings.factor_directory:
+        raise ValueError("正式回测的因子输入目录与本次调优不一致")
+    if backtest.INDEX_RAW_DATA_DIR != settings.index_price_directory:
+        raise ValueError("正式回测的指数行情目录与本次调优不一致")
+    if (
+        backtest.ACCOUNT_COUNT != settings.stagger_days
+        or backtest.ACCOUNT_REBALANCE_INTERVAL != settings.stagger_days
+    ):
+        raise ValueError("正式回测的错峰账户设置与本次调优不一致")
     if tuple(backtest.SCORE_METHODS_TO_RUN) != SCORE_METHODS:
         raise ValueError(
             "正式回测需同时启用return_r2和return_vol，"
@@ -699,7 +808,10 @@ def run_grid(
         for member in members
     }
     print("一次性读取指数历史价格并预计算全部过滤指标……", flush=True)
-    price_history = backtest.load_filter_price_history(all_index_codes)
+    price_history = backtest.load_filter_price_history(
+        all_index_codes,
+        backtest.INDEX_RAW_DATA_DIR,
+    )
     filter_metrics = precompute_filter_metrics(
         backtest,
         factor_universes,
@@ -791,7 +903,7 @@ def save_heatmaps(
     matrices: Mapping[tuple[str, str], np.ndarray],
     windows: Sequence[int],
     uppers: Sequence[float],
-    output_dir: Path = OUTPUT_DIR,
+    settings: BiasTuningSettings,
 ) -> list[Path]:
     values = np.concatenate([matrix.ravel() for matrix in matrices.values()])
     finite_values = values[np.isfinite(values)]
@@ -811,7 +923,7 @@ def save_heatmaps(
         "DejaVu Sans",
     ]
     plt.rcParams["axes.unicode_minus"] = False
-    output_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_directory.mkdir(parents=True, exist_ok=True)
 
     method_labels = {
         "return_r2": "收益率×R平方",
@@ -835,6 +947,12 @@ def save_heatmaps(
     ]
     saved: list[Path] = []
     current_parameter = (backtest.BIAS_WINDOW, backtest.BIAS_UPPER)
+    volatility_description = (
+        f"高波动前{backtest.VOL_KEEP_TOP_RATIO:.0%}"
+        f"（{backtest.VOL_RETURN_DAYS}日收益窗口）"
+        if settings.vol_filter_enabled
+        else "波动率过滤关闭"
+    )
 
     for method in SCORE_METHODS:
         for mode in TRADE_MODES:
@@ -904,9 +1022,11 @@ def save_heatmaps(
                 0.0,
                 -0.095,
                 "固定参数："
+                f"更新频率{settings.update_frequency}；"
+                f"过滤状态{settings.filter_profile}；"
                 f"聚类阈值{backtest.CLUSTER_CORRELATION_THRESHOLD:g}；"
                 f"趋势窗口{backtest.TREND_WINDOW}日；"
-                f"高波动前{backtest.VOL_KEEP_TOP_RATIO:.0%}；"
+                f"{volatility_description}；"
                 f"过滤后Top{backtest.TOP_PERCENT:.0%}；"
                 f"{backtest.ACCOUNT_COUNT}账户错峰；"
                 f"单边成本{backtest.TRANSACTION_COST_RATE:.1%}；"
@@ -918,7 +1038,9 @@ def save_heatmaps(
             )
             figure.tight_layout()
 
-            output_path = output_dir / OUTPUT_FILES[(method, mode)]
+            output_path = (
+                settings.output_directory / OUTPUT_FILES[(method, mode)]
+            )
             temporary_path = output_path.with_name(
                 f".{output_path.stem}.tmp{output_path.suffix}"
             )
@@ -929,10 +1051,28 @@ def save_heatmaps(
     return saved
 
 
-def main() -> None:
-    backtest = load_backtest_module()
-    validate_grid(backtest)
+def main(
+    update_frequency: str = UPDATE_FREQUENCY,
+    filter_profile: str = FILTER_PROFILE,
+    correlation_threshold: float = CLUSTER_CORRELATION_THRESHOLD,
+    trend_window: int = TREND_WINDOW,
+    stagger_days: int = ACCOUNT_REBALANCE_INTERVAL,
+) -> None:
+    settings = build_tuning_settings(
+        update_frequency,
+        filter_profile,
+        correlation_threshold,
+        trend_window,
+        stagger_days,
+    )
+    backtest = load_backtest_module(settings)
+    validate_grid(backtest, settings)
     print(
+        f"实验组合：{settings.update_frequency} / "
+        f"{settings.filter_profile} / "
+        f"阈值{settings.correlation_threshold:g} / "
+        f"趋势窗口{settings.trend_window}日 / "
+        f"错峰{settings.stagger_days}日。\n"
         f"BIAS参数网格：窗口{BIAS_WINDOWS[0]}至{BIAS_WINDOWS[-1]}日，"
         f"上限{BIAS_UPPERS[0]:.0%}至{BIAS_UPPERS[-1]:.0%}；"
         f"共{len(BIAS_WINDOWS) * len(BIAS_UPPERS)}组参数，"
@@ -946,6 +1086,7 @@ def main() -> None:
         matrices,
         BIAS_WINDOWS,
         BIAS_UPPERS,
+        settings,
     )
     print("完成，仅生成以下四张参数热力图：", flush=True)
     for path in output_paths:
