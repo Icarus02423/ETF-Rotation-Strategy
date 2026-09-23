@@ -31,11 +31,9 @@ scripts/
   ETF数据下载/
   ETF池筛选/
   ETF趋势策略回测/
-  ETF策略检验/
 outputs/
   etf_data/                # ETF原始数据和派生宽表
   etf_pool/                # ETF池与指数聚类结果
-  etf_strategy_test/       # RankIC等检验结果
   etf_trend_strategy/      # 因子、指数行情和全部回测输出
 ```
 
