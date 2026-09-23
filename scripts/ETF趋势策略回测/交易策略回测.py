@@ -14,13 +14,16 @@ ETF趋势轮动策略回测。
 7. 买入和卖出均收取0.1%的单边交易成本。
 
 输入：
-- outputs/etf_trend_strategy/threshold_<阈值>/factors/window_<窗口>/YYYY.csv
-- outputs/etf_trend_strategy/threshold_<阈值>/index_prices/*.csv（过滤指标）
+- outputs/etf_trend_strategy/<更新频率>/threshold_<阈值>/
+  factors/window_<窗口>/YYYY.csv
+- outputs/etf_trend_strategy/<更新频率>/threshold_<阈值>/
+  index_prices/*.csv（过滤指标）
 - outputs/etf_data/etf_data.csv
 - outputs/benchmark_data/*.csv（按BENCHMARK_CODE选择）
 
 输出：
-- d账户错峰：<得分公式>/staggered_<d>d/<成交方式>/
+- <更新频率>/threshold_<阈值>/backtest/<过滤状态>/window_<窗口>/
+  <得分公式>/staggered_<d>d/<成交方式>/
   每个交易模式独立输出年度指标、总回测指标、合并持仓、时序和账户明细五个Excel，
   以及累计净值、累计超额、换手率、累计交易成本和策略容量五张图。
 """
@@ -30,6 +33,7 @@ from __future__ import annotations
 import csv
 import math
 import statistics
+import sys
 from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
@@ -47,24 +51,40 @@ from openpyxl.utils import get_column_letter
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from 实验配置 import (
+    CORRELATION_THRESHOLDS,
+    FILTER_PROFILE_SETTINGS,
+    STAGGER_DAYS,
+    TREND_FACTORS,
+    TREND_WINDOWS,
+    UPDATE_FREQUENCIES,
+    ExperimentCase,
+)
+from 输出路径 import backtest_result_dir, factor_dir, index_price_dir
 
 # ============================= 回测参数 =============================
+UPDATE_FREQUENCY = "daily"
+FILTER_PROFILE = "base"
 CLUSTER_CORRELATION_THRESHOLD = 0.9
-TREND_WINDOW = 15
+TREND_FACTOR = "return_r2"
+TREND_WINDOW = 20
 # 评价基准代码；需与“下载基准数据.py”中的BENCHMARK_CODE保持一致。
 BENCHMARK_CODE = "000510.CSI"
-# 默认一次运行两种得分。若以后只想跑其中一种，可只保留对应英文键。
+# 保留该变量供现有参数调优脚本兼容使用；正式实验入口一次只运行一个趋势因子。
 SCORE_METHODS_TO_RUN = ("return_r2", "return_vol")
 TOP_PERCENT = 0.10
 # 错峰周期d：d个账户，每天轮换一个，各持有d个交易日。
-ACCOUNT_REBALANCE_INTERVAL = 4
+ACCOUNT_REBALANCE_INTERVAL = 1
 ACCOUNT_COUNT = ACCOUNT_REBALANCE_INTERVAL
 # 排名前过滤；关闭两项即为无过滤对照。上下限为实验初值，非优化结果。
-VOL_FILTER_ENABLED = True
+VOL_FILTER_ENABLED = False
 VOL_FILTER_MODE = "high"  # high：保留高波动；low：保留低波动。
-VOL_RETURN_DAYS = 18  # 日收益个数，使用21个收盘价；独立于趋势窗口。
+VOL_RETURN_DAYS = 18  # 日收益个数，使用19个收盘价；独立于趋势窗口。
 VOL_KEEP_TOP_RATIO = 0.55
-BIAS_MODE = "upper"  # none / lower / upper / both
+BIAS_MODE = "none"  # none / lower / upper / both
 BIAS_WINDOW = 36  # 均线使用的收盘价个数，包含信号当日。
 BIAS_LOWER = -0.05  # lower、both：BIAS >= 下限。
 BIAS_UPPER = +0.09  # upper、both：BIAS <= 上限。
@@ -79,8 +99,8 @@ CAPACITY_DAILY_AMOUNT_RATIO = 0.10
 CAPACITY_DESCENDING_QUANTILE = 0.95
 # ====================================================================
 
-ALLOWED_CLUSTER_THRESHOLDS = (0.7, 0.8, 0.9)
-ALLOWED_TREND_WINDOWS = (10, 15, 20, 40, 60)
+ALLOWED_CLUSTER_THRESHOLDS = CORRELATION_THRESHOLDS
+ALLOWED_TREND_WINDOWS = TREND_WINDOWS
 SCORE_COLUMNS = {
     "return_r2": "趋势质量因子",
     "return_vol": "风险调整趋势得分",
@@ -89,25 +109,29 @@ SCORE_LABELS = {
     "return_r2": "收益率×R平方",
     "return_vol": "收益率÷波动率",
 }
-FACTOR_DIR = (
-    PROJECT_ROOT
-    / "outputs"
-    / "etf_trend_strategy"
-    / f"threshold_{CLUSTER_CORRELATION_THRESHOLD:g}"
-    / "factors"
-    / f"window_{TREND_WINDOW}"
+DEFAULT_EXPERIMENT_CASE = ExperimentCase(
+    update_frequency=UPDATE_FREQUENCY,
+    filter_profile=FILTER_PROFILE,
+    correlation_threshold=CLUSTER_CORRELATION_THRESHOLD,
+    trend_factor=TREND_FACTOR,
+    trend_window=TREND_WINDOW,
+    stagger_days=ACCOUNT_REBALANCE_INTERVAL,
+)
+FACTOR_DIR = factor_dir(
+    UPDATE_FREQUENCY,
+    CLUSTER_CORRELATION_THRESHOLD,
+    TREND_WINDOW,
 )
 ETF_DATA_FILE = PROJECT_ROOT / "outputs" / "etf_data" / "etf_data.csv"
-INDEX_RAW_DATA_DIR = FACTOR_DIR.parent.parent / "index_prices"
-BENCHMARK_DIR = PROJECT_ROOT / "outputs" / "benchmark_data"
-BACKTEST_DIR = (
-    PROJECT_ROOT
-    / "outputs"
-    / "etf_trend_strategy"
-    / f"threshold_{CLUSTER_CORRELATION_THRESHOLD:g}"
-    / "backtest"
-    / f"window_{TREND_WINDOW}"
+INDEX_RAW_DATA_DIR = index_price_dir(
+    UPDATE_FREQUENCY,
+    CLUSTER_CORRELATION_THRESHOLD,
 )
+BENCHMARK_DIR = PROJECT_ROOT / "outputs" / "benchmark_data"
+BACKTEST_DIR = backtest_result_dir(
+    DEFAULT_EXPERIMENT_CASE,
+    "close",
+).parents[2]
 
 FACTOR_REQUIRED_COLUMNS = {
     "日期",
@@ -129,6 +153,15 @@ ETF_REQUIRED_COLUMNS = {
     "VWAP",
 }
 BENCHMARK_REQUIRED_COLUMNS = {"日期", "代码", "名称", "收盘价"}
+
+
+@dataclass(frozen=True)
+class BacktestRunSettings:
+    experiment_case: ExperimentCase
+    factor_directory: Path
+    index_price_directory: Path
+    bias_mode: str
+    vol_filter_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -513,6 +546,64 @@ def build_benchmark_records(
     return baseline_date, result
 
 
+def validate_experiment_case(experiment_case: ExperimentCase) -> None:
+    if experiment_case.update_frequency not in UPDATE_FREQUENCIES:
+        raise ValueError(
+            f"update_frequency只能是：{', '.join(UPDATE_FREQUENCIES)}"
+        )
+    if experiment_case.filter_profile not in FILTER_PROFILE_SETTINGS:
+        raise ValueError(
+            "filter_profile只能是："
+            + "、".join(FILTER_PROFILE_SETTINGS)
+        )
+    if not any(
+        math.isclose(
+            experiment_case.correlation_threshold,
+            allowed,
+            abs_tol=1e-12,
+        )
+        for allowed in CORRELATION_THRESHOLDS
+    ):
+        raise ValueError(
+            f"correlation_threshold只能是：{CORRELATION_THRESHOLDS}"
+        )
+    if experiment_case.trend_factor not in TREND_FACTORS:
+        raise ValueError(f"trend_factor只能是：{TREND_FACTORS}")
+    if experiment_case.trend_window not in TREND_WINDOWS:
+        raise ValueError(f"trend_window只能是：{TREND_WINDOWS}")
+    if experiment_case.stagger_days not in STAGGER_DAYS:
+        raise ValueError(f"stagger_days只能是：{STAGGER_DAYS}")
+
+
+def build_run_settings(
+    experiment_case: ExperimentCase,
+) -> BacktestRunSettings:
+    validate_experiment_case(experiment_case)
+    profile_settings = FILTER_PROFILE_SETTINGS[
+        experiment_case.filter_profile
+    ]
+    bias_mode = profile_settings["bias_mode"]
+    vol_filter_enabled = profile_settings["vol_filter_enabled"]
+    if bias_mode not in {"none", "lower", "upper", "both"}:
+        raise ValueError("过滤状态中的bias_mode无效")
+    if not isinstance(vol_filter_enabled, bool):
+        raise ValueError("过滤状态中的vol_filter_enabled必须是布尔值")
+    return BacktestRunSettings(
+        experiment_case=experiment_case,
+        factor_directory=factor_dir(
+            experiment_case.update_frequency,
+            experiment_case.correlation_threshold,
+            experiment_case.trend_window,
+        ),
+        index_price_directory=index_price_dir(
+            experiment_case.update_frequency,
+            experiment_case.correlation_threshold,
+        ),
+        bias_mode=bias_mode,
+        vol_filter_enabled=vol_filter_enabled,
+    )
+
+
 def validate_parameters() -> None:
     if not clean_text(BENCHMARK_CODE):
         raise ValueError("BENCHMARK_CODE不能为空")
@@ -574,11 +665,19 @@ def validate_parameters() -> None:
 
 def load_filter_price_history(
     required_index_codes: set[str],
+    index_price_directory: Path | None = None,
 ) -> dict[str, tuple[list[date], list[float]]]:
-    """合并月度指数价格；重复日期只保留一个价格，并检查冲突。"""
-    files = sorted(INDEX_RAW_DATA_DIR.glob("*.csv"))
+    """合并指数价格；重复日期只保留一个价格，并检查冲突。"""
+    source_directory = (
+        INDEX_RAW_DATA_DIR
+        if index_price_directory is None
+        else index_price_directory
+    )
+    files = sorted(source_directory.glob("*.csv"))
     if not files:
-        raise FileNotFoundError(f"找不到过滤所需指数历史CSV：{INDEX_RAW_DATA_DIR}")
+        raise FileNotFoundError(
+            f"找不到过滤所需指数历史CSV：{source_directory}"
+        )
     closes_by_code: dict[str, dict[date, float]] = defaultdict(dict)
     for path in files:
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -607,14 +706,32 @@ def load_filter_price_history(
     return history
 
 
-def passes_bias_filter(bias: float) -> bool:
+def passes_bias_filter(
+    bias: float,
+    bias_mode: str | None = None,
+) -> bool:
+    resolved_bias_mode = BIAS_MODE if bias_mode is None else bias_mode
     # 收盘价除均线的浮点误差不应把恰在闭区间边界的指数剔除。
-    if BIAS_MODE in {"lower", "both"} and bias < BIAS_LOWER and not math.isclose(
-        bias, BIAS_LOWER, rel_tol=0.0, abs_tol=1e-12
+    if (
+        resolved_bias_mode in {"lower", "both"}
+        and bias < BIAS_LOWER
+        and not math.isclose(
+            bias,
+            BIAS_LOWER,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
     ):
         return False
-    if BIAS_MODE in {"upper", "both"} and bias > BIAS_UPPER and not math.isclose(
-        bias, BIAS_UPPER, rel_tol=0.0, abs_tol=1e-12
+    if (
+        resolved_bias_mode in {"upper", "both"}
+        and bias > BIAS_UPPER
+        and not math.isclose(
+            bias,
+            BIAS_UPPER,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
     ):
         return False
     return True
@@ -624,16 +741,23 @@ def filter_eligible_members(
     signal_date: date,
     members: Sequence[FactorMember],
     price_history: Mapping[str, tuple[Sequence[date], Sequence[float]]],
+    run_settings: BacktestRunSettings | None = None,
 ) -> tuple[FactorMember, ...]:
     """先过滤全池；波动资格来自BIAS过滤前的当日全体有效指数。"""
-    if not VOL_FILTER_ENABLED and BIAS_MODE == "none":
+    vol_filter_enabled = (
+        VOL_FILTER_ENABLED
+        if run_settings is None
+        else run_settings.vol_filter_enabled
+    )
+    bias_mode = BIAS_MODE if run_settings is None else run_settings.bias_mode
+    if not vol_filter_enabled and bias_mode == "none":
         return tuple(members)
     volatilities: dict[str, float] = {}
     biases: dict[str, float] = {}
     for member in members:
-        needs_bias = BIAS_MODE != "none"
+        needs_bias = bias_mode != "none"
         required_prices = max(
-            VOL_RETURN_DAYS + 1 if VOL_FILTER_ENABLED else 0,
+            VOL_RETURN_DAYS + 1 if vol_filter_enabled else 0,
             BIAS_WINDOW if needs_bias else 0,
         )
         price_dates, prices = price_history.get(member.index_code, ((), ()))
@@ -644,7 +768,7 @@ def filter_eligible_members(
             )
         if (signal_date - price_dates[end - 1]).days > MAX_PRICE_STALENESS_CALENDAR_DAYS:
             raise ValueError(f"{signal_date} {member.index_code}过滤历史价格过期")
-        if VOL_FILTER_ENABLED:
+        if vol_filter_enabled:
             window = prices[end - VOL_RETURN_DAYS - 1 : end]
             daily_returns = [later / earlier - 1.0 for earlier, later in zip(window, window[1:])]
             volatility = statistics.stdev(daily_returns)
@@ -655,7 +779,7 @@ def filter_eligible_members(
             bias_prices = prices[end - BIAS_WINDOW : end]
             biases[member.index_code] = prices[end - 1] / statistics.mean(bias_prices) - 1.0
     kept_vol_codes: set[str] = set()
-    if VOL_FILTER_ENABLED:
+    if vol_filter_enabled:
         keep_count = math.ceil(len(members) * VOL_KEEP_TOP_RATIO)
         kept_vol_codes = set(
             sorted(
@@ -670,23 +794,50 @@ def filter_eligible_members(
         )
     return tuple(
         member for member in members
-        if (not VOL_FILTER_ENABLED or member.index_code in kept_vol_codes)
-        and (BIAS_MODE == "none" or passes_bias_filter(biases[member.index_code]))
+        if (not vol_filter_enabled or member.index_code in kept_vol_codes)
+        and (
+            bias_mode == "none"
+            or passes_bias_filter(
+                biases[member.index_code],
+                bias_mode,
+            )
+        )
     )
 
 
 def read_daily_top_factors(
     score_column: str,
+    run_settings: BacktestRunSettings | None = None,
 ) -> dict[date, DailyFactorSelection]:
-    if not FACTOR_DIR.exists():
-        raise FileNotFoundError(f"找不到趋势因子目录：{FACTOR_DIR}")
+    factor_directory = (
+        FACTOR_DIR
+        if run_settings is None
+        else run_settings.factor_directory
+    )
+    index_price_directory = (
+        INDEX_RAW_DATA_DIR
+        if run_settings is None
+        else run_settings.index_price_directory
+    )
+    vol_filter_enabled = (
+        VOL_FILTER_ENABLED
+        if run_settings is None
+        else run_settings.vol_filter_enabled
+    )
+    bias_mode = BIAS_MODE if run_settings is None else run_settings.bias_mode
+    if not factor_directory.exists():
+        raise FileNotFoundError(
+            f"找不到趋势因子目录：{factor_directory}"
+        )
     files = sorted(
         path
-        for path in FACTOR_DIR.glob("*.csv")
+        for path in factor_directory.glob("*.csv")
         if not path.name.startswith(".") and path.stem.isdigit()
     )
     if not files:
-        raise FileNotFoundError(f"趋势因子目录没有年度CSV：{FACTOR_DIR}")
+        raise FileNotFoundError(
+            f"趋势因子目录没有年度CSV：{factor_directory}"
+        )
 
     members_by_date: dict[date, dict[str, FactorMember]] = defaultdict(dict)
     for path in files:
@@ -716,8 +867,15 @@ def read_daily_top_factors(
                 )
 
     price_history = (
-        load_filter_price_history({code for members in members_by_date.values() for code in members})
-        if VOL_FILTER_ENABLED or BIAS_MODE != "none"
+        load_filter_price_history(
+            {
+                code
+                for members in members_by_date.values()
+                for code in members
+            },
+            index_price_directory,
+        )
+        if vol_filter_enabled or bias_mode != "none"
         else {}
     )
     daily_selections: dict[date, DailyFactorSelection] = {}
@@ -726,7 +884,10 @@ def read_daily_top_factors(
         if not valid_members:
             continue
         eligible_members = filter_eligible_members(
-            signal_date, valid_members, price_history
+            signal_date,
+            valid_members,
+            price_history,
+            run_settings,
         )
         sorted_members = sorted(
             eligible_members,
@@ -1069,6 +1230,7 @@ def run_backtest(
     trading_dates: Sequence[date],
     targets: Mapping[date, DailyTarget],
     prices: Mapping[date, Mapping[str, PricePoint]],
+    run_settings: BacktestRunSettings | None = None,
 ) -> tuple[
     list[HoldingRecord],
     list[NavRecord],
@@ -1080,14 +1242,19 @@ def run_backtest(
         raise ValueError(f"未知回测模式：{mode}")
     if not trading_dates:
         raise ValueError("没有可用交易日期")
+    stagger_days = (
+        ACCOUNT_REBALANCE_INTERVAL
+        if run_settings is None
+        else run_settings.experiment_case.stagger_days
+    )
 
     accounts = [
         AccountState(
             account_id=account_index + 1,
             positions={},
-            cash=INITIAL_NAV / ACCOUNT_COUNT,
+            cash=INITIAL_NAV / stagger_days,
         )
-        for account_index in range(ACCOUNT_COUNT)
+        for account_index in range(stagger_days)
     ]
     for account_index, account in enumerate(accounts):
         first_position = account_index if mode == "close" else account_index + 1
@@ -1173,7 +1340,7 @@ def run_backtest(
             )
             rebalance_account.positions = rebalance_result.positions
             rebalance_account.cash = rebalance_result.cash
-            next_position = date_position + ACCOUNT_REBALANCE_INTERVAL
+            next_position = date_position + stagger_days
             rebalance_account.next_rebalance_date = (
                 trading_dates[next_position]
                 if next_position < len(trading_dates)
@@ -1675,8 +1842,14 @@ def build_validation_rows(
     mode: str,
     holding_records: Sequence[HoldingRecord],
     nav_records: Sequence[NavRecord],
+    run_settings: BacktestRunSettings | None = None,
 ) -> list[dict[str, object]]:
     label = MODE_LABELS[mode]
+    stagger_days = (
+        ACCOUNT_REBALANCE_INTERVAL
+        if run_settings is None
+        else run_settings.experiment_case.stagger_days
+    )
     holdings_by_date: dict[date, float] = defaultdict(float)
     for record in holding_records:
         holdings_by_date[record.current_date] += record.actual_weight
@@ -1724,7 +1897,7 @@ def build_validation_rows(
     initial_build_count = len(initial_build_accounts)
     initial_build_valid = (
         len(initial_build_accounts) == len(set(initial_build_accounts))
-        and initial_build_count <= ACCOUNT_COUNT
+        and initial_build_count <= stagger_days
     )
     skipped_count = sum(
         record.rebalance_attempted and not record.rebalance_succeeded
@@ -1804,7 +1977,7 @@ def build_validation_rows(
             0.0 if initial_build_valid else 1.0,
             0.0,
             initial_build_valid,
-            f"{ACCOUNT_COUNT}个账户分别至多初始建仓1次；收费，但不计入平均和年化换手率",
+            f"{stagger_days}个账户分别至多初始建仓1次；收费，但不计入平均和年化换手率",
         ),
         check_row(
             "跳过调仓次数（信息项）",
@@ -1984,8 +2157,29 @@ def write_backtest_metrics_workbook(
     benchmark: BenchmarkData,
     output_dir: Path,
     score_method: str,
+    run_settings: BacktestRunSettings | None = None,
 ) -> Path:
     """按参考项目单独输出总回测指标和参数。"""
+
+    if run_settings is None:
+        update_frequency = UPDATE_FREQUENCY
+        filter_profile = FILTER_PROFILE
+        correlation_threshold = CLUSTER_CORRELATION_THRESHOLD
+        trend_window = TREND_WINDOW
+        stagger_days = ACCOUNT_REBALANCE_INTERVAL
+        vol_filter_enabled = VOL_FILTER_ENABLED
+        bias_mode = BIAS_MODE
+    else:
+        experiment_case = run_settings.experiment_case
+        if score_method != experiment_case.trend_factor:
+            raise ValueError("参数表的趋势因子与本次实验不一致")
+        update_frequency = experiment_case.update_frequency
+        filter_profile = experiment_case.filter_profile
+        correlation_threshold = experiment_case.correlation_threshold
+        trend_window = experiment_case.trend_window
+        stagger_days = experiment_case.stagger_days
+        vol_filter_enabled = run_settings.vol_filter_enabled
+        bias_mode = run_settings.bias_mode
 
     performance = calculate_performance(nav_records)
     relative_performance = calculate_relative_performance(
@@ -2081,20 +2275,22 @@ def write_backtest_metrics_workbook(
     parameter_sheet.append(["类别", "参数 / 约束", "本项目设置"])
     execution_label = mode_execution_label(mode)
     account_structure_label = (
-        f"{ACCOUNT_COUNT}个独立账户逐日错峰持有"
-        f"{ACCOUNT_REBALANCE_INTERVAL}个交易日"
+        f"{stagger_days}个独立账户逐日错峰持有"
+        f"{stagger_days}个交易日"
     )
     planned_rebalance_label = "每个交易日1个"
     transfer_label = "无；各账户独立复利并保留自己的现金"
     parameter_rows = [
         ["基本信息", "执行价格", execution_label],
+        ["基本信息", "指数池更新频率", update_frequency],
+        ["基本信息", "过滤状态", filter_profile],
         ["基准设置", "基准名称", benchmark.name],
         ["基准设置", "基准代码", benchmark.code],
         ["基准设置", "基准累计净值", "基准当日收盘价÷回测首日前一基准交易日收盘价"],
         ["基准设置", "净值图起点", INITIAL_NAV],
         ["基准设置", "超额净值", "策略累计净值÷基准累计净值；共同起点为1"],
-        ["趋势策略", "聚类相关性阈值", CLUSTER_CORRELATION_THRESHOLD],
-        ["趋势策略", "趋势因子窗口", TREND_WINDOW],
+        ["趋势策略", "聚类相关性阈值", correlation_threshold],
+        ["趋势策略", "趋势因子窗口", trend_window],
         ["趋势策略", "排名得分公式", SCORE_LABELS[score_method]],
         [
             "趋势策略",
@@ -2102,8 +2298,8 @@ def write_backtest_metrics_workbook(
             "R_N × R²" if score_method == "return_r2" else "R_N ÷ σ_N",
         ],
         ["因子定义", "计算价格", "代表指数收盘价"],
-        ["因子定义", "窗口价格个数 N", TREND_WINDOW],
-        ["因子定义", "窗口日收益个数", TREND_WINDOW - 1],
+        ["因子定义", "窗口价格个数 N", trend_window],
+        ["因子定义", "窗口日收益个数", trend_window - 1],
         ["因子定义", "窗口收益率 R_N", "窗口末收盘价÷窗口首收盘价−1"],
         [
             "因子定义",
@@ -2111,7 +2307,7 @@ def write_backtest_metrics_workbook(
             (
                 "log(指数收盘价)对时间的含截距OLS拟合优度；不以回归斜率代替收益率"
                 if score_method == "return_r2"
-                else f"简单日收益样本标准差(ddof=1) × √{TREND_WINDOW - 1}；非年化波动"
+                else f"简单日收益样本标准差(ddof=1) × √{trend_window - 1}；非年化波动"
             ),
         ],
         ["趋势策略", "调仓日入选比例", TOP_PERCENT],
@@ -2119,7 +2315,7 @@ def write_backtest_metrics_workbook(
         ["趋势过滤", "入选数量", "ceil(过滤后合格指数数×入选比例)；合格池为空时为0"],
         ["趋势过滤", "正收益限制", "无；按原趋势得分排名，允许窗口收益率为零或负数"],
         ["趋势过滤", "未通过处理", "不参与趋势排名；入选并匹配的ETF等权，无候选时当天调仓账户空仓"],
-        ["波动过滤", "是否启用", "是" if VOL_FILTER_ENABLED else "否"],
+        ["波动过滤", "是否启用", "是" if vol_filter_enabled else "否"],
         [
             "波动过滤",
             "过滤模式",
@@ -2127,7 +2323,7 @@ def write_backtest_metrics_workbook(
                 "保留高波动（high）"
                 if VOL_FILTER_MODE == "high"
                 else "保留低波动（low）"
-            ) if VOL_FILTER_ENABLED else "未启用",
+            ) if vol_filter_enabled else "未启用",
         ],
         ["波动过滤", "日收益窗口 L", VOL_RETURN_DAYS],
         ["波动过滤", "价格个数", VOL_RETURN_DAYS + 1],
@@ -2142,25 +2338,25 @@ def write_backtest_metrics_workbook(
                 else "当日全体有效代表指数波动升序，保留ceil(指数数×比例)；并列按指数代码升序"
             ),
         ],
-        ["BIAS过滤", "BIAS模式", BIAS_MODE],
+        ["BIAS过滤", "BIAS模式", bias_mode],
         ["BIAS过滤", "均线窗口 M", BIAS_WINDOW],
         ["BIAS过滤", "BIAS公式", "截至信号日最新指数收盘价÷最近M个收盘价的简单均值−1；均线含最新价格"],
-        ["BIAS过滤", "BIAS下限", BIAS_LOWER if BIAS_MODE in {"lower", "both"} else "未启用"],
-        ["BIAS过滤", "BIAS上限", BIAS_UPPER if BIAS_MODE in {"upper", "both"} else "未启用"],
+        ["BIAS过滤", "BIAS下限", BIAS_LOWER if bias_mode in {"lower", "both"} else "未启用"],
+        ["BIAS过滤", "BIAS上限", BIAS_UPPER if bias_mode in {"upper", "both"} else "未启用"],
         ["BIAS过滤", "通过条件", {
             "none": "不限制BIAS", "lower": "BIAS ≥ 下限",
             "upper": "BIAS ≤ 上限", "both": "下限 ≤ BIAS ≤ 上限",
-        }[BIAS_MODE]],
+        }[bias_mode]],
         ["过滤数据", "价格日期", "只使用不晚于信号日的指数价格；次日VWAP使用原信号日指标"],
         ["过滤数据", "价格允许滞后（自然日）", MAX_PRICE_STALENESS_CALENDAR_DAYS],
         ["过滤数据", "缺失历史处理", "启用的过滤指标历史不足或过期时报错；不缩小波动排名分母"],
         ["ETF选择", "代表ETF选择", "跟踪同一指数中当日成交量最大"],
         ["账户结构", "调仓模式", "staggered"],
         ["账户结构", "组合结构", account_structure_label],
-        ["账户结构", "账户数量", ACCOUNT_COUNT],
-        ["账户结构", "每账户初始资金比例", 1.0 / ACCOUNT_COUNT],
+        ["账户结构", "账户数量", stagger_days],
+        ["账户结构", "每账户初始资金比例", 1.0 / stagger_days],
         ["账户结构", "计划调仓账户数", planned_rebalance_label],
-        ["账户结构", "单账户调仓间隔（交易日）", ACCOUNT_REBALANCE_INTERVAL],
+        ["账户结构", "单账户调仓间隔（交易日）", stagger_days],
         ["账户结构", "账户之间资金转移", transfer_label],
         ["交易设置", "初始净值 NAV₀", INITIAL_NAV],
         ["收益参数", "年化无风险利率 r_f", ANNUAL_RISK_FREE_RATE],
@@ -2444,9 +2640,9 @@ def write_mode_workbooks(
     account_holding_records: Sequence[AccountHoldingRecord],
     account_trade_records: Sequence[AccountTradeRecord],
     score_method: str,
-    score_backtest_dir: Path,
+    output_dir: Path,
+    run_settings: BacktestRunSettings | None = None,
 ) -> list[Path]:
-    output_dir = score_backtest_dir / mode
     output_dir.mkdir(parents=True, exist_ok=True)
     return [
         write_annual_metrics_workbook(
@@ -2462,6 +2658,7 @@ def write_mode_workbooks(
             benchmark,
             output_dir,
             score_method,
+            run_settings,
         ),
         write_holdings_workbook(mode, holding_records, output_dir),
         write_time_series_workbook(
@@ -2491,12 +2688,11 @@ def write_mode_figures(
     nav_records: Sequence[NavRecord],
     benchmark_records: Sequence[BenchmarkRecord],
     baseline_date: date,
-    score_backtest_dir: Path,
+    output_dir: Path,
     benchmark_name: str,
 ) -> list[Path]:
     """每种交易模式独立生成图表，不和另一模式叠加。"""
 
-    output_dir = score_backtest_dir / mode
     output_dir.mkdir(parents=True, exist_ok=True)
     plt.style.use("default")
     plt.rcParams["font.sans-serif"] = [
@@ -2655,10 +2851,21 @@ def validate_mode_outputs(
     account_trade_records: Sequence[AccountTradeRecord],
     workbook_paths: Sequence[Path],
     figure_paths: Sequence[Path],
+    run_settings: BacktestRunSettings | None = None,
 ) -> None:
+    stagger_days = (
+        ACCOUNT_REBALANCE_INTERVAL
+        if run_settings is None
+        else run_settings.experiment_case.stagger_days
+    )
     failures = [
         row
-        for row in build_validation_rows(mode, holding_records, nav_records)
+        for row in build_validation_rows(
+            mode,
+            holding_records,
+            nav_records,
+            run_settings,
+        )
         if row["状态"] == "FAIL"
     ]
     if failures:
@@ -2691,9 +2898,10 @@ def validate_mode_outputs(
     for date_position, nav_record in enumerate(nav_records):
         current_date = nav_record.current_date
         rows = account_rows_by_date.get(current_date, [])
-        if len(rows) != ACCOUNT_COUNT:
+        if len(rows) != stagger_days:
             raise RuntimeError(
-                f"{mode}账户校验失败：{current_date}不是{ACCOUNT_COUNT}个账户"
+                f"{mode}账户校验失败：{current_date}不是"
+                f"{stagger_days}个账户"
             )
         account_nav_sum = sum(row.account_nav for row in rows)
         if not math.isclose(account_nav_sum, nav_record.nav, abs_tol=2e-12):
@@ -2715,10 +2923,10 @@ def validate_mode_outputs(
             date_positions[later] - date_positions[earlier]
             for earlier, later in zip(attempted_dates, attempted_dates[1:])
         ]
-        if any(gap != ACCOUNT_REBALANCE_INTERVAL for gap in gaps):
+        if any(gap != stagger_days for gap in gaps):
             raise RuntimeError(
                 f"{mode}账户校验失败：账户{account_id}并非每"
-                f"{ACCOUNT_REBALANCE_INTERVAL}个交易日调仓"
+                f"{stagger_days}个交易日调仓"
             )
 
     trade_cost_by_date: dict[date, float] = defaultdict(float)
@@ -2809,16 +3017,32 @@ def validate_mode_outputs(
             raise RuntimeError(f"输出文件缺失或为空：{path}")
 
 
-def main() -> None:
+def main(
+    update_frequency: str = UPDATE_FREQUENCY,
+    filter_profile: str = FILTER_PROFILE,
+    correlation_threshold: float = CLUSTER_CORRELATION_THRESHOLD,
+    trend_factor: str = TREND_FACTOR,
+    trend_window: int = TREND_WINDOW,
+    stagger_days: int = ACCOUNT_REBALANCE_INTERVAL,
+) -> None:
+    experiment_case = ExperimentCase(
+        update_frequency=update_frequency,
+        filter_profile=filter_profile,
+        correlation_threshold=correlation_threshold,
+        trend_factor=trend_factor,
+        trend_window=trend_window,
+        stagger_days=stagger_days,
+    )
+    run_settings = build_run_settings(experiment_case)
     validate_parameters()
     benchmark = load_benchmark_data()
     rebalance_description = (
-        f"初始资金分成 {ACCOUNT_COUNT} 个独立账户，每天轮换1个账户，"
-        f"每账户持有 {ACCOUNT_REBALANCE_INTERVAL} 个交易日"
+        f"初始资金分成 {stagger_days} 个独立账户，每天轮换1个账户，"
+        f"每账户持有 {stagger_days} 个交易日"
     )
     volatility_filter_description = (
         "关闭"
-        if not VOL_FILTER_ENABLED
+        if not run_settings.vol_filter_enabled
         else (
             f"{VOL_FILTER_MODE}（保留"
             f"{'高' if VOL_FILTER_MODE == 'high' else '低'}波动"
@@ -2826,12 +3050,13 @@ def main() -> None:
         )
     )
     print(
-        f"聚类阈值 {CLUSTER_CORRELATION_THRESHOLD:g}，"
-        f"趋势窗口 {TREND_WINDOW}，先过滤全池，再选择合格指数得分前 {TOP_PERCENT:.0%}；"
+        f"更新频率 {update_frequency}，过滤状态 {filter_profile}，"
+        f"聚类阈值 {correlation_threshold:g}，趋势窗口 {trend_window}，"
+        f"先过滤全池，再选择合格指数得分前 {TOP_PERCENT:.0%}；"
         f"不限制窗口收益率正负；波动过滤={volatility_filter_description}，"
-        f"BIAS模式={BIAS_MODE}；"
+        f"BIAS模式={run_settings.bias_mode}；"
         f"{rebalance_description}；"
-        "本次依次回测两种得分公式。",
+        f"本次只回测 {trend_factor}。",
         flush=True,
     )
     print(
@@ -2839,138 +3064,143 @@ def main() -> None:
         f"共 {len(benchmark.closes)} 个交易日。",
         flush=True,
     )
-    for score_method in SCORE_METHODS_TO_RUN:
-        score_column = SCORE_COLUMNS[score_method]
-        score_label = SCORE_LABELS[score_method]
-        score_backtest_dir = (
-            BACKTEST_DIR
-            / score_method
-            / ACCOUNT_VARIANT_DIR
-        )
-        print(f"\n开始回测：{score_label}（{score_column}）", flush=True)
+    score_method = trend_factor
+    score_column = SCORE_COLUMNS[score_method]
+    score_label = SCORE_LABELS[score_method]
+    print(f"\n开始回测：{score_label}（{score_column}）", flush=True)
 
-        daily_selections = read_daily_top_factors(score_column)
-        targets, full_trading_calendar = build_daily_targets(daily_selections)
-        first_signal_date = min(targets)
-        last_signal_date = max(targets)
-        benchmark_end_date = max(benchmark.closes)
-        effective_last_date = min(last_signal_date, benchmark_end_date)
-        if effective_last_date < first_signal_date:
-            raise ValueError(
-                f"基准数据截至 {benchmark_end_date}，早于首个趋势信号日 "
-                f"{first_signal_date}。"
-            )
-        if effective_last_date < last_signal_date:
-            print(
-                f"基准数据截至 {benchmark_end_date}，本次回测比较区间同步截止到该日。",
-                flush=True,
-            )
-        trading_dates = [
-            current_date
-            for current_date in full_trading_calendar
-            if first_signal_date <= current_date <= effective_last_date
-        ]
-        targets_in_range = {
-            current_date: target
-            for current_date, target in targets.items()
-            if first_signal_date <= current_date <= effective_last_date
-        }
-        missing_calendar_dates = sorted(set(targets_in_range) - set(trading_dates))
-        if missing_calendar_dates:
-            raise ValueError(
-                "趋势信号日期不在ETF交易日历中："
-                + ",".join(value.isoformat() for value in missing_calendar_dates[:10])
-            )
-        selected_codes = {
-            member.etf_code
-            for target in targets_in_range.values()
-            for member in target.members
-        }
-        unmapped_count = sum(
-            target.unmapped_index_count for target in targets_in_range.values()
+    daily_selections = read_daily_top_factors(
+        score_column,
+        run_settings,
+    )
+    targets, full_trading_calendar = build_daily_targets(daily_selections)
+    first_signal_date = min(targets)
+    last_signal_date = max(targets)
+    benchmark_end_date = max(benchmark.closes)
+    effective_last_date = min(last_signal_date, benchmark_end_date)
+    if effective_last_date < first_signal_date:
+        raise ValueError(
+            f"基准数据截至 {benchmark_end_date}，早于首个趋势信号日 "
+            f"{first_signal_date}。"
         )
-        filtered_count = sum(
-            target.filtered_index_count for target in targets_in_range.values()
-        )
+    if effective_last_date < last_signal_date:
         print(
-            f"共 {len(trading_dates)} 个实际ETF交易日，"
-            f"实际涉及 {len(selected_codes)} 只ETF，"
-            f"排名前过滤指数-日期记录 {filtered_count} 条，"
-            f"无法映射的指数-日期记录 {unmapped_count} 条。",
+            f"基准数据截至 {benchmark_end_date}，"
+            "本次回测比较区间同步截止到该日。",
             flush=True,
         )
-        prices = load_selected_prices(selected_codes, set(trading_dates))
+    trading_dates = [
+        current_date
+        for current_date in full_trading_calendar
+        if first_signal_date <= current_date <= effective_last_date
+    ]
+    targets_in_range = {
+        current_date: target
+        for current_date, target in targets.items()
+        if first_signal_date <= current_date <= effective_last_date
+    }
+    missing_calendar_dates = sorted(set(targets_in_range) - set(trading_dates))
+    if missing_calendar_dates:
+        raise ValueError(
+            "趋势信号日期不在ETF交易日历中："
+            + ",".join(
+                value.isoformat() for value in missing_calendar_dates[:10]
+            )
+        )
+    selected_codes = {
+        member.etf_code
+        for target in targets_in_range.values()
+        for member in target.members
+    }
+    unmapped_count = sum(
+        target.unmapped_index_count for target in targets_in_range.values()
+    )
+    filtered_count = sum(
+        target.filtered_index_count for target in targets_in_range.values()
+    )
+    print(
+        f"共 {len(trading_dates)} 个实际ETF交易日，"
+        f"实际涉及 {len(selected_codes)} 只ETF，"
+        f"排名前过滤指数-日期记录 {filtered_count} 条，"
+        f"无法映射的指数-日期记录 {unmapped_count} 条。",
+        flush=True,
+    )
+    prices = load_selected_prices(selected_codes, set(trading_dates))
 
-        for mode in ("close", "next_day_vwap"):
-            (
-                holdings,
-                nav_records,
-                account_daily_records,
-                account_holding_records,
-                account_trade_records,
-            ) = run_backtest(
-                mode,
-                trading_dates,
-                targets_in_range,
-                prices,
-            )
-            baseline_date, benchmark_records = build_benchmark_records(
-                nav_records,
-                benchmark,
-            )
-            workbook_paths = write_mode_workbooks(
-                mode,
-                holdings,
-                nav_records,
-                benchmark_records,
-                baseline_date,
-                benchmark,
-                account_daily_records,
-                account_holding_records,
-                account_trade_records,
-                score_method,
-                score_backtest_dir,
-            )
-            figure_paths = write_mode_figures(
-                mode,
-                nav_records,
-                benchmark_records,
-                baseline_date,
-                score_backtest_dir,
-                benchmark.name,
-            )
-            validate_mode_outputs(
-                mode,
-                holdings,
-                nav_records,
-                benchmark_records,
-                account_daily_records,
-                account_holding_records,
-                account_trade_records,
-                workbook_paths,
-                figure_paths,
-            )
-            performance = calculate_performance(nav_records)
-            relative_performance = calculate_relative_performance(
-                nav_records,
-                benchmark_records,
-            )
-            print(
-                f"✅ {score_label} / {mode} 回测完成：年化收益率 "
-                f"{float(performance['年化收益率']):.2%}，"
-                f"Sharpe {float(performance['夏普比率']):.2f}，"
-                f"最大回撤 {float(performance['最大回撤']):.2%}，"
-                f"累计超额 {float(relative_performance['超额累计收益率']):.2%}，"
-                f"信息比率 {float(relative_performance['信息比率']):.2f}，"
-                f"平均每日单边换手率 "
-                f"{float(performance['平均每日单边换手率']):.2%}；"
-                f"输出目录：{score_backtest_dir / mode}\n"
-                + "\n".join(
-                    f"  {path.name}"
-                    for path in [*workbook_paths, *figure_paths]
-                ),
-                flush=True,
-            )
+    for mode in ("close", "next_day_vwap"):
+        output_directory = backtest_result_dir(experiment_case, mode)
+        (
+            holdings,
+            nav_records,
+            account_daily_records,
+            account_holding_records,
+            account_trade_records,
+        ) = run_backtest(
+            mode,
+            trading_dates,
+            targets_in_range,
+            prices,
+            run_settings,
+        )
+        baseline_date, benchmark_records = build_benchmark_records(
+            nav_records,
+            benchmark,
+        )
+        workbook_paths = write_mode_workbooks(
+            mode,
+            holdings,
+            nav_records,
+            benchmark_records,
+            baseline_date,
+            benchmark,
+            account_daily_records,
+            account_holding_records,
+            account_trade_records,
+            score_method,
+            output_directory,
+            run_settings,
+        )
+        figure_paths = write_mode_figures(
+            mode,
+            nav_records,
+            benchmark_records,
+            baseline_date,
+            output_directory,
+            benchmark.name,
+        )
+        validate_mode_outputs(
+            mode,
+            holdings,
+            nav_records,
+            benchmark_records,
+            account_daily_records,
+            account_holding_records,
+            account_trade_records,
+            workbook_paths,
+            figure_paths,
+            run_settings,
+        )
+        performance = calculate_performance(nav_records)
+        relative_performance = calculate_relative_performance(
+            nav_records,
+            benchmark_records,
+        )
+        print(
+            f"✅ {score_label} / {mode} 回测完成：年化收益率 "
+            f"{float(performance['年化收益率']):.2%}，"
+            f"Sharpe {float(performance['夏普比率']):.2f}，"
+            f"最大回撤 {float(performance['最大回撤']):.2%}，"
+            f"累计超额 {float(relative_performance['超额累计收益率']):.2%}，"
+            f"信息比率 {float(relative_performance['信息比率']):.2f}，"
+            f"平均每日单边换手率 "
+            f"{float(performance['平均每日单边换手率']):.2%}；"
+            f"输出目录：{output_directory}\n"
+            + "\n".join(
+                f"  {path.name}"
+                for path in [*workbook_paths, *figure_paths]
+            ),
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
