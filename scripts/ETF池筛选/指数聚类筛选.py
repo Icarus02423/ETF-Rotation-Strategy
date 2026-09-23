@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-按日对ETF对应指数进行收益来源去重，生成每日动态指数池。
+按日度或月度快照对ETF对应指数进行收益来源去重，生成动态指数池。
 
 处理逻辑：
-1. 读取每日ETF初筛结果及对应指数60个共同交易区间收益率；
+1. 读取指定更新频率的ETF初筛结果及对应指数60个共同交易区间收益率；
 2. 检查全部指数的60个收益日期完全一致，计算指数收益率相关矩阵；
 3. 将相关矩阵转换为距离矩阵：Distance = 1 - Corr；
 4. 使用complete linkage层次聚类，阈值由参数区设定；
 5. 每个聚类仅保留过去20个市场交易日平均成交额最大的ETF及其对应指数。
 
 输入：
-- outputs/etf_pool/initial/YYYY_MM_DD.csv
-- outputs/etf_pool/index_returns/window_60/YYYY_MM_DD.csv
+- outputs/etf_pool/<更新频率>/initial/YYYY_MM_DD.csv
+- outputs/etf_pool/<更新频率>/index_returns/window_60/YYYY_MM_DD.csv
 - outputs/etf_data/etf_data.csv（用于计算20日平均成交额）
 
 输出：
-- outputs/etf_pool/clusters/threshold_<相关性阈值>/reports/YYYY_MM_DD.xlsx
-- 每个工作簿的第一张表为当日动态指数池；
+- outputs/etf_pool/<更新频率>/clusters/threshold_<相关性阈值>/reports/YYYY_MM_DD.xlsx
+- 每个工作簿的第一张表为当前筛选日动态指数池；
 - 第二张表为代表筛选前所有原始指数的完整相关性矩阵。
 - 第三张表为每个聚类的全部成员、代表ETF及聚类内相关性。
 - 为保持原有输入格式不变，指数收益率CSV首列仍使用“月末交易日”，
@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import csv
 import math
+import sys
 from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
@@ -46,32 +47,26 @@ from scipy.spatial.distance import squareform
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-INITIAL_SELECTION_DIR = PROJECT_ROOT / "outputs" / "etf_pool" / "initial"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from 实验配置 import CORRELATION_THRESHOLDS, UPDATE_FREQUENCIES
+from 输出路径 import (
+    cluster_report_dir,
+    etf_pool_initial_dir,
+    index_return_dir,
+)
+
+
 ETF_DATA_FILE = PROJECT_ROOT / "outputs" / "etf_data" / "etf_data.csv"
 # ============================= 聚类参数 =============================
-# 可改为0.7、0.8或0.9；距离阈值自动按1 - CORRELATION_THRESHOLD计算。
+# 直接运行本脚本时使用的频率和阈值；总运行器以后会显式传入实验参数。
+UPDATE_FREQUENCY = "daily"
 CORRELATION_THRESHOLD = 0.9
-ALLOWED_CORRELATION_THRESHOLDS = (0.7, 0.8, 0.9)
 
 RETURN_TRADING_DAYS = 60
 TURNOVER_LOOKBACK_DAYS = 20
 # ====================================================================
-
-INDEX_RETURN_DIR = (
-    PROJECT_ROOT
-    / "outputs"
-    / "etf_pool"
-    / "index_returns"
-    / f"window_{RETURN_TRADING_DAYS}"
-)
-OUTPUT_DIR = (
-    PROJECT_ROOT
-    / "outputs"
-    / "etf_pool"
-    / "clusters"
-    / f"threshold_{CORRELATION_THRESHOLD:g}"
-    / "reports"
-)
 
 INITIAL_REQUIRED_COLUMNS = {
     "日期",
@@ -105,18 +100,21 @@ CLUSTER_DETAIL_COLUMNS = [
     "相关性阈值",
     "距离阈值",
 ]
+
+
 @dataclass(frozen=True)
-class MonthInput:
+class SelectionInput:
     """一个筛选交易日的ETF初筛数据和指数收益率文件。"""
 
     selection_date: date
     initial_file: Path
     index_return_file: Path
+    output_file: Path
     etf_rows: tuple[Mapping[str, str], ...]
 
     @property
     def file_name(self) -> str:
-        return self.selection_date.strftime("%Y_%m_%d.xlsx")
+        return self.output_file.name
 
     @property
     def etf_codes(self) -> set[str]:
@@ -125,6 +123,7 @@ class MonthInput:
     @property
     def index_codes(self) -> set[str]:
         return {clean_text(row.get("对标指数代码")) for row in self.etf_rows}
+
 
 def clean_text(value: object) -> str:
     if value is None:
@@ -160,7 +159,9 @@ def parse_finite_number(value: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def read_initial_month(path: Path) -> tuple[list[str], tuple[Mapping[str, str], ...]]:
+def read_initial_selection(
+    path: Path,
+) -> tuple[list[str], tuple[Mapping[str, str], ...]]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         fieldnames = list(reader.fieldnames or [])
@@ -177,32 +178,42 @@ def read_initial_month(path: Path) -> tuple[list[str], tuple[Mapping[str, str], 
     return fieldnames, rows
 
 
-def discover_month_inputs() -> tuple[list[str], list[MonthInput]]:
-    if not INITIAL_SELECTION_DIR.exists():
-        raise FileNotFoundError(f"找不到ETF初筛目录：{INITIAL_SELECTION_DIR}")
-    if not INDEX_RETURN_DIR.exists():
-        raise FileNotFoundError(f"找不到指数收益率目录：{INDEX_RETURN_DIR}")
+def discover_selection_inputs(
+    initial_selection_dir: Path,
+    index_returns_directory: Path,
+    output_directory: Path,
+) -> tuple[list[str], list[SelectionInput]]:
+    if not initial_selection_dir.exists():
+        raise FileNotFoundError(f"找不到ETF初筛目录：{initial_selection_dir}")
+    if not index_returns_directory.exists():
+        raise FileNotFoundError(
+            f"找不到指数收益率目录：{index_returns_directory}"
+        )
 
-    initial_files = sorted(INITIAL_SELECTION_DIR.glob("*.csv"))
+    initial_files = sorted(
+        path
+        for path in initial_selection_dir.glob("*.csv")
+        if path.is_file()
+    )
     if not initial_files:
-        raise FileNotFoundError(f"ETF初筛目录没有CSV：{INITIAL_SELECTION_DIR}")
+        raise FileNotFoundError(f"ETF初筛目录没有CSV：{initial_selection_dir}")
 
     common_fieldnames: list[str] | None = None
-    months: list[MonthInput] = []
+    selections: list[SelectionInput] = []
     for initial_file in initial_files:
         try:
             file_date = datetime.strptime(initial_file.stem, "%Y_%m_%d").date()
         except ValueError as exc:
             raise ValueError(f"ETF初筛文件名日期无效：{initial_file.name}") from exc
 
-        index_return_file = INDEX_RETURN_DIR / initial_file.name
+        index_return_file = index_returns_directory / initial_file.name
         if not index_return_file.exists():
             raise FileNotFoundError(
                 f"{initial_file.name}缺少对应指数收益率文件："
                 f"{index_return_file}"
             )
 
-        fieldnames, rows = read_initial_month(initial_file)
+        fieldnames, rows = read_initial_selection(initial_file)
         if common_fieldnames is None:
             common_fieldnames = fieldnames
         elif fieldnames != common_fieldnames:
@@ -216,16 +227,20 @@ def discover_month_inputs() -> tuple[list[str], list[MonthInput]]:
                 f"{initial_file.name}内的日期与文件名不一致："
                 f"{sorted(selection_dates)}"
             )
-        months.append(
-            MonthInput(
+        selections.append(
+            SelectionInput(
                 selection_date=file_date,
                 initial_file=initial_file,
                 index_return_file=index_return_file,
+                output_file=(
+                    output_directory
+                    / file_date.strftime("%Y_%m_%d.xlsx")
+                ),
                 etf_rows=rows,
             )
         )
 
-    return common_fieldnames or [], months
+    return common_fieldnames or [], selections
 
 
 def inspect_etf_data_dates(path: Path) -> list[date]:
@@ -247,12 +262,12 @@ def inspect_etf_data_dates(path: Path) -> list[date]:
 
 
 def build_turnover_windows(
-    months: Sequence[MonthInput],
+    selections: Sequence[SelectionInput],
     available_dates: Sequence[date],
 ) -> dict[str, tuple[date, ...]]:
     windows: dict[str, tuple[date, ...]] = {}
-    for month in months:
-        position = bisect_right(available_dates, month.selection_date)
+    for selection in selections:
+        position = bisect_right(available_dates, selection.selection_date)
         window = tuple(
             available_dates[
                 position - TURNOVER_LOOKBACK_DAYS : position
@@ -260,18 +275,20 @@ def build_turnover_windows(
         )
         if len(window) != TURNOVER_LOOKBACK_DAYS:
             raise ValueError(
-                f"{month.selection_date}之前不足"
+                f"{selection.selection_date}之前不足"
                 f"{TURNOVER_LOOKBACK_DAYS}个市场交易日"
             )
-        if window[-1] != month.selection_date:
-            raise ValueError(f"{month.selection_date}不在etf_data.csv交易日中")
-        windows[month.file_name] = window
+        if window[-1] != selection.selection_date:
+            raise ValueError(
+                f"{selection.selection_date}不在etf_data.csv交易日中"
+            )
+        windows[selection.file_name] = window
     return windows
 
 
 def calculate_average_turnover(
     path: Path,
-    months: Sequence[MonthInput],
+    selections: Sequence[SelectionInput],
     windows: Mapping[str, Sequence[date]],
 ) -> dict[tuple[str, str], float]:
     """按ETF初筛口径计算20个市场交易日平均成交额。
@@ -279,86 +296,95 @@ def calculate_average_turnover(
     ETF在某日没有记录或成交额为空时按0计，分母固定为20。
     """
 
-    etf_codes_by_month = {
-        month.file_name: month.etf_codes for month in months
+    etf_codes_by_selection = {
+        selection.file_name: selection.etf_codes
+        for selection in selections
     }
-    months_by_turnover_date: dict[date, list[str]] = defaultdict(list)
+    selections_by_turnover_date: dict[date, list[str]] = defaultdict(list)
     for file_name, turnover_dates in windows.items():
         for turnover_date in turnover_dates:
-            months_by_turnover_date[turnover_date].append(file_name)
+            selections_by_turnover_date[turnover_date].append(file_name)
 
     # 保留到“筛选日 + ETF + 日期”级别，避免源文件意外重复行被重复累加。
     amounts: dict[str, dict[str, dict[date, float]]] = {
-        month.file_name: defaultdict(dict) for month in months
+        selection.file_name: defaultdict(dict)
+        for selection in selections
     }
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
             current_date = parse_date(row.get("日期"), "日期")
-            related_months = months_by_turnover_date.get(current_date)
-            if not related_months:
+            related_selections = selections_by_turnover_date.get(current_date)
+            if not related_selections:
                 continue
             etf_code = clean_text(row.get("代码"))
             amount = parse_finite_number(row.get("成交额")) or 0.0
-            for file_name in related_months:
-                if etf_code in etf_codes_by_month[file_name]:
+            for file_name in related_selections:
+                if etf_code in etf_codes_by_selection[file_name]:
                     amounts[file_name][etf_code][current_date] = amount
 
     averages: dict[tuple[str, str], float] = {}
-    for month in months:
-        for etf_code in month.etf_codes:
-            total_amount = sum(amounts[month.file_name][etf_code].values())
-            averages[(month.file_name, etf_code)] = (
+    for selection in selections:
+        for etf_code in selection.etf_codes:
+            total_amount = sum(
+                amounts[selection.file_name][etf_code].values()
+            )
+            averages[(selection.file_name, etf_code)] = (
                 total_amount / TURNOVER_LOOKBACK_DAYS
             )
     return averages
 
 
-def read_month_index_returns(
-    month: MonthInput,
+def read_selection_index_returns(
+    selection: SelectionInput,
 ) -> dict[str, dict[date, float]]:
     returns_by_code: dict[str, dict[date, float]] = defaultdict(dict)
-    with month.index_return_file.open(
+    with selection.index_return_file.open(
         "r", encoding="utf-8-sig", newline=""
     ) as handle:
         reader = csv.DictReader(handle)
         missing_columns = INDEX_REQUIRED_COLUMNS - set(reader.fieldnames or [])
         if missing_columns:
             raise ValueError(
-                f"{month.index_return_file.name}缺少列：{sorted(missing_columns)}"
+                f"{selection.index_return_file.name}缺少列："
+                f"{sorted(missing_columns)}"
             )
         for row_number, row in enumerate(reader, start=2):
-            month_end = parse_date(row.get("月末交易日"), "月末交易日")
-            if month_end != month.selection_date:
+            recorded_selection_date = parse_date(
+                row.get("月末交易日"),
+                "月末交易日",
+            )
+            if recorded_selection_date != selection.selection_date:
                 raise ValueError(
-                    f"{month.index_return_file.name}第{row_number}行月末交易日"
+                    f"{selection.index_return_file.name}第{row_number}行月末交易日"
                     f"与文件名不一致"
                 )
             index_code = clean_text(row.get("对标指数代码"))
-            if index_code not in month.index_codes:
+            if index_code not in selection.index_codes:
                 continue
             return_date = parse_date(row.get("收益日期"), "收益日期")
             daily_return = parse_finite_number(row.get("日收益率"))
             if daily_return is None:
                 raise ValueError(
-                    f"{month.index_return_file.name}第{row_number}行日收益率无效"
+                    f"{selection.index_return_file.name}第{row_number}行"
+                    "日收益率无效"
                 )
             if return_date in returns_by_code[index_code]:
                 raise ValueError(
-                    f"{month.index_return_file.name}存在重复收益率："
+                    f"{selection.index_return_file.name}存在重复收益率："
                     f"{index_code} {return_date}"
                 )
             returns_by_code[index_code][return_date] = daily_return
 
-    missing_codes = sorted(month.index_codes - set(returns_by_code))
+    missing_codes = sorted(selection.index_codes - set(returns_by_code))
     if missing_codes:
         raise ValueError(
-            f"{month.index_return_file.name}缺少指数收益率："
+            f"{selection.index_return_file.name}缺少指数收益率："
             f"{'、'.join(missing_codes)}"
         )
     wrong_length_codes = sorted(
         code
-        for code in month.index_codes
+        for code in selection.index_codes
         if len(returns_by_code[code]) != RETURN_TRADING_DAYS
     )
     if wrong_length_codes:
@@ -367,11 +393,11 @@ def read_month_index_returns(
             for code in wrong_length_codes
         )
         raise ValueError(
-            f"{month.index_return_file.name}不是每个指数都有"
+            f"{selection.index_return_file.name}不是每个指数都有"
             f"{RETURN_TRADING_DAYS}日收益率：{details}"
         )
 
-    ordered_codes = sorted(month.index_codes)
+    ordered_codes = sorted(selection.index_codes)
     reference_dates = tuple(sorted(returns_by_code[ordered_codes[0]]))
     mismatched_codes = [
         index_code
@@ -380,7 +406,7 @@ def read_month_index_returns(
     ]
     if mismatched_codes:
         raise ValueError(
-            f"{month.index_return_file.name}的指数收益日期不统一："
+            f"{selection.index_return_file.name}的指数收益日期不统一："
             f"{'、'.join(mismatched_codes)}；请先重新运行指数收益率准备.py"
         )
     return dict(returns_by_code)
@@ -441,13 +467,14 @@ def calculate_correlation_and_distance_matrices(
 def complete_linkage_clusters(
     index_codes: Sequence[str],
     distance_matrix: np.ndarray,
+    correlation_threshold: float,
 ) -> dict[str, int]:
     if not index_codes:
         return {}
     if len(index_codes) == 1:
         return {index_codes[0]: 1}
 
-    distance_threshold = 1.0 - CORRELATION_THRESHOLD
+    distance_threshold = 1.0 - correlation_threshold
     condensed_distance = squareform(distance_matrix, checks=False)
     linkage_matrix = linkage(condensed_distance, method="complete")
     raw_labels = fcluster(
@@ -491,12 +518,12 @@ def complete_linkage_clusters(
 
 
 def select_cluster_representatives(
-    month: MonthInput,
+    selection: SelectionInput,
     cluster_by_code: Mapping[str, int],
     average_turnover: Mapping[tuple[str, str], float],
 ) -> list[dict[str, str]]:
     rows_by_cluster: dict[int, list[Mapping[str, str]]] = defaultdict(list)
-    for row in month.etf_rows:
+    for row in selection.etf_rows:
         index_code = clean_text(row.get("对标指数代码"))
         rows_by_cluster[cluster_by_code[index_code]].append(row)
 
@@ -517,7 +544,7 @@ def select_cluster_representatives(
             rows,
             key=lambda row: (
                 -average_turnover[
-                    (month.file_name, clean_text(row.get("代码")))
+                    (selection.file_name, clean_text(row.get("代码")))
                 ],
                 clean_text(row.get("代码")),
             ),
@@ -527,7 +554,10 @@ def select_cluster_representatives(
         output_row.update(
             {
                 "过去20个交易日平均成交额": format(
-                    average_turnover[(month.file_name, winner_code)], ".15g"
+                    average_turnover[
+                        (selection.file_name, winner_code)
+                    ],
+                    ".15g",
                 ),
                 "聚类编号": str(cluster_number),
                 "聚类指数数量": str(index_count_by_cluster[cluster_number]),
@@ -538,12 +568,13 @@ def select_cluster_representatives(
 
 
 def build_cluster_detail_rows(
-    month: MonthInput,
+    selection: SelectionInput,
     cluster_by_code: Mapping[str, int],
     average_turnover: Mapping[tuple[str, str], float],
     selected_rows: Sequence[Mapping[str, str]],
     index_codes: Sequence[str],
     correlation_matrix: np.ndarray,
+    correlation_threshold: float,
 ) -> list[dict[str, str]]:
     """保留代表筛选前的所有指数，输出每个聚类的成员信息。"""
 
@@ -552,7 +583,7 @@ def build_cluster_detail_rows(
         for row in selected_rows
     }
     rows_by_cluster: dict[int, list[Mapping[str, str]]] = defaultdict(list)
-    for row in month.etf_rows:
+    for row in selection.etf_rows:
         index_code = clean_text(row.get("对标指数代码"))
         rows_by_cluster[cluster_by_code[index_code]].append(row)
 
@@ -593,7 +624,7 @@ def build_cluster_detail_rows(
             index_code = clean_text(member.get("对标指数代码"))
             is_representative = etf_code == representative_etf_code
             member_average_turnover = average_turnover[
-                (month.file_name, etf_code)
+                (selection.file_name, etf_code)
             ]
             representative_correlation = float(
                 correlation_matrix[
@@ -623,11 +654,11 @@ def build_cluster_detail_rows(
                     else format(minimum_cluster_correlation, ".15g")
                 ),
                 "相关性阈值": format(
-                    CORRELATION_THRESHOLD,
+                    correlation_threshold,
                     ".15g",
                 ),
                 "距离阈值": format(
-                    1.0 - CORRELATION_THRESHOLD,
+                    1.0 - correlation_threshold,
                     ".15g",
                 ),
             }
@@ -668,18 +699,18 @@ def excel_cell_value(field_name: str, value: object) -> object:
     return clean_text(value)
 
 
-def write_month_workbook(
+def write_selection_workbook(
     path: Path,
     fieldnames: Sequence[str],
     rows: Sequence[Mapping[str, str]],
-    month: MonthInput,
+    selection: SelectionInput,
     index_codes: Sequence[str],
     correlation_matrix: np.ndarray,
     cluster_detail_rows: Sequence[Mapping[str, str]],
 ) -> None:
     output_fieldnames = list(fieldnames) + ADDED_OUTPUT_COLUMNS
     index_name_by_code: dict[str, str] = {}
-    for row in month.etf_rows:
+    for row in selection.etf_rows:
         index_code = clean_text(row.get("对标指数代码"))
         index_name_by_code.setdefault(
             index_code,
@@ -983,10 +1014,17 @@ def write_month_workbook(
         workbook.close()
 
 
-def validate_parameters() -> None:
+def validate_parameters(
+    update_frequency: str,
+    correlation_threshold: float,
+) -> None:
+    if update_frequency not in UPDATE_FREQUENCIES:
+        raise ValueError(
+            f"UPDATE_FREQUENCY只能是：{', '.join(UPDATE_FREQUENCIES)}"
+        )
     if not any(
-        math.isclose(CORRELATION_THRESHOLD, allowed, abs_tol=1e-12)
-        for allowed in ALLOWED_CORRELATION_THRESHOLDS
+        math.isclose(correlation_threshold, allowed, abs_tol=1e-12)
+        for allowed in CORRELATION_THRESHOLDS
     ):
         raise ValueError(
             "CORRELATION_THRESHOLD只能设为0.7、0.8或0.9"
@@ -997,44 +1035,71 @@ def validate_parameters() -> None:
         raise ValueError("TURNOVER_LOOKBACK_DAYS必须大于0")
 
 
-def remove_stale_outputs(expected_file_names: set[str]) -> int:
-    stale_files = [
-        path
-        for path in OUTPUT_DIR.iterdir()
-        if path.is_file()
-        and path.suffix.lower() in {".csv", ".xlsx"}
-        and path.name not in expected_file_names
-    ]
+def remove_stale_outputs(
+    output_directory: Path,
+    expected_file_names: set[str],
+) -> int:
+    stale_files: list[Path] = []
+    for path in output_directory.iterdir():
+        if (
+            not path.is_file()
+            or path.suffix.lower() != ".xlsx"
+            or path.name in expected_file_names
+        ):
+            continue
+        try:
+            output_date = datetime.strptime(path.stem, "%Y_%m_%d")
+        except ValueError:
+            continue
+        if output_date.strftime("%Y_%m_%d") != path.stem:
+            continue
+        stale_files.append(path)
     for path in stale_files:
         path.unlink()
     return len(stale_files)
 
 
-def main() -> None:
-    validate_parameters()
-    fieldnames, months = discover_month_inputs()
+def main(
+    update_frequency: str = UPDATE_FREQUENCY,
+    correlation_threshold: float = CORRELATION_THRESHOLD,
+) -> None:
+    validate_parameters(update_frequency, correlation_threshold)
+    initial_selection_dir = etf_pool_initial_dir(update_frequency)
+    index_returns_directory = index_return_dir(
+        update_frequency,
+        RETURN_TRADING_DAYS,
+    )
+    output_directory = cluster_report_dir(
+        update_frequency,
+        correlation_threshold,
+    )
+    fieldnames, selections = discover_selection_inputs(
+        initial_selection_dir,
+        index_returns_directory,
+        output_directory,
+    )
     print(
-        f"发现 {len(months)} 个日度ETF初筛池；"
-        f"相关性阈值 {CORRELATION_THRESHOLD:g}，"
-        f"距离阈值 {1.0 - CORRELATION_THRESHOLD:g}，"
+        f"发现 {len(selections)} 个{update_frequency} ETF初筛池；"
+        f"相关性阈值 {correlation_threshold:g}，"
+        f"距离阈值 {1.0 - correlation_threshold:g}，"
         "聚类方法 complete linkage",
         flush=True,
     )
 
     print("正在从etf_data.csv确定交易日日历...", flush=True)
     available_dates = inspect_etf_data_dates(ETF_DATA_FILE)
-    turnover_windows = build_turnover_windows(months, available_dates)
+    turnover_windows = build_turnover_windows(selections, available_dates)
     print("正在计算入选ETF过去20个交易日平均成交额...", flush=True)
     average_turnover = calculate_average_turnover(
         ETF_DATA_FILE,
-        months,
+        selections,
         turnover_windows,
     )
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for position, month in enumerate(months, start=1):
-        returns_by_code = read_month_index_returns(month)
-        index_codes = sorted(month.index_codes)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    for position, selection in enumerate(selections, start=1):
+        returns_by_code = read_selection_index_returns(selection)
+        index_codes = sorted(selection.index_codes)
         correlation_matrix, distance_matrix = (
             calculate_correlation_and_distance_matrices(
                 index_codes,
@@ -1044,49 +1109,51 @@ def main() -> None:
         cluster_by_code = complete_linkage_clusters(
             index_codes,
             distance_matrix,
+            correlation_threshold,
         )
         selected_rows = select_cluster_representatives(
-            month,
+            selection,
             cluster_by_code,
             average_turnover,
         )
         cluster_detail_rows = build_cluster_detail_rows(
-            month,
+            selection,
             cluster_by_code,
             average_turnover,
             selected_rows,
             index_codes,
             correlation_matrix,
+            correlation_threshold,
         )
-        output_path = OUTPUT_DIR / month.file_name
-        write_month_workbook(
-            output_path,
+        write_selection_workbook(
+            selection.output_file,
             fieldnames,
             selected_rows,
-            month,
+            selection,
             index_codes,
             correlation_matrix,
             cluster_detail_rows,
         )
         print(
-            f"{month.selection_date}：{len(index_codes)} 个指数 -> "
+            f"{selection.selection_date}：{len(index_codes)} 个指数 -> "
             f"{len(selected_rows)} 个聚类代表，"
             f"已保存动态指数池、完整相关性矩阵和聚类明细 "
-            f"{output_path} ({position}/{len(months)})",
+            f"{selection.output_file} ({position}/{len(selections)})",
             flush=True,
         )
 
     removed_count = remove_stale_outputs(
-        {month.file_name for month in months}
+        output_directory,
+        {selection.file_name for selection in selections},
     )
     if removed_count:
         print(f"已清理 {removed_count} 个旧聚类输出文件", flush=True)
 
     print(
-        f"完成：共生成 {len(months)} 个日度XLSX，"
+        f"完成：共生成 {len(selections)} 个{update_frequency} XLSX，"
         "第一张表为动态指数池，第二张表为完整相关性矩阵，"
         "第三张表为聚类明细，"
-        f"输出目录：{OUTPUT_DIR}",
+        f"输出目录：{output_directory}",
         flush=True,
     )
 
