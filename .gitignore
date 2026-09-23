@@ -6,6 +6,7 @@
 !requirements.txt
 !pyproject.toml
 !实验配置.py
+!输出路径.py
 !scripts/
 !scripts/**
 !tests/
