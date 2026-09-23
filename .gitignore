@@ -5,6 +5,7 @@
 !README.md
 !requirements.txt
 !pyproject.toml
+!实验配置.py
 !scripts/
 !scripts/**
 !tests/
