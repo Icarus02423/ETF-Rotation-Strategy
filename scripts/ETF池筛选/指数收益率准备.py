@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-按日下载初筛ETF对应指数的历史收盘价，并计算60个共同交易区间收益率。
+按日度或月度快照下载初筛ETF对应指数的历史收盘价，并计算60个共同交易区间收益率。
 
 本脚本只负责聚类前的数据准备，不计算相关矩阵，也不执行层次聚类。
 
 数据来源：
-- 从 outputs/etf_pool/initial 读取每日ETF初筛结果；
+- 从 outputs/etf_pool/<更新频率>/initial 读取ETF初筛结果；
 - 指数收盘价优先使用 iFinD 的 cmd_history_quotation；
 - iFinD失败或数据不足时，仅对参数区明确配置的同一指数使用AKShare回退；
 - 唯一下载指标为 close；
-- 每日先找出当日全部指数共有的最近61个收盘日期；
+- 每个筛选日先找出全部指数共有的最近61个收盘日期；
 - 日收益率 = 本共同日期收盘价 / 上一共同日期收盘价 - 1。
 
 输出：
-- outputs/etf_pool/index_returns/window_60/YYYY_MM_DD.csv；
-- 每个交易日对应一个独立CSV；
+- outputs/etf_pool/<更新频率>/index_returns/window_60/YYYY_MM_DD.csv；
+- 每个筛选日对应一个独立CSV；
 - 每个指数使用完全相同的61个共同收盘日期计算60个收益率；
 - 不会把不同交易日的数据合并成一张总表；
-- 为保持原有输出格式不变，首列仍命名为“月末交易日”，
+- 为保持下游兼容，首列仍命名为“月末交易日”，
   其中填写当前筛选交易日。
 
 断点规则：
-- 已存在且结构完整的日度CSV直接跳过，不调用 cmd_history_quotation；
-- 输出不完整或当日指数池发生变化时，重新下载并原子覆盖当日CSV；
+- 已存在且结构完整的CSV直接跳过，不调用 cmd_history_quotation；
+- 输出不完整或当日指数池发生变化时，重新下载并原子覆盖对应CSV；
 - 同一次运行内，同一指数的重叠日期区间只请求一次。
 """
 
@@ -44,12 +44,20 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-INITIAL_SELECTION_DIR = PROJECT_ROOT / "outputs" / "etf_pool" / "initial"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from 实验配置 import UPDATE_FREQUENCIES
+from 输出路径 import etf_pool_initial_dir, index_return_dir
+
+
 ETF_DOWNLOADER_SCRIPT = (
     PROJECT_ROOT / "scripts" / "ETF数据下载" / "下载ETF数据.py"
 )
 
 # ============================== 下载参数 ==============================
+# 直接运行本脚本时使用的频率；总运行器以后会显式传入daily或monthly。
+UPDATE_FREQUENCY = "daily"
 RETURN_TRADING_DAYS = 60
 
 # 60个收益率需要61个有效收盘价。首次向前预留180个自然日，通常足以
@@ -61,9 +69,9 @@ MAX_LOOKBACK_CALENDAR_DAYS = 730
 # 每次只请求之前没有覆盖的日期区间。
 LOOKBACK_CALENDAR_DAY_STEPS = (180, 240, 300, 365, 540, 730)
 
-# False：完整的日度输出直接跳过，避免重复调用历史行情接口。
-# True：忽略已有日度输出并重新下载、覆盖全部交易日。
-OVERWRITE_EXISTING_DAYS = False
+# False：完整输出直接跳过，避免重复调用历史行情接口。
+# True：忽略已有输出并重新下载、覆盖当前频率的全部筛选日。
+OVERWRITE_EXISTING_OUTPUTS = False
 
 # iFinD无法取得某个指数时使用AKShare的同一指数数据。
 # 每项格式：iFinD代码: (AKShare接口名, AKShare标的, 日期列, 收盘价列)
@@ -74,14 +82,6 @@ AKSHARE_FALLBACK_CONFIG: dict[str, tuple[str, str, str, str]] = {
     "DJI.GI": ("index_us_stock_sina", ".DJI", "date", "close"),
 }
 # ====================================================================
-
-OUTPUT_DIR = (
-    PROJECT_ROOT
-    / "outputs"
-    / "etf_pool"
-    / "index_returns"
-    / f"window_{RETURN_TRADING_DAYS}"
-)
 
 HISTORY_ENDPOINT = "cmd_history_quotation"
 HISTORY_INDICATOR = "close"
@@ -102,16 +102,13 @@ OUTPUT_COLUMNS = [
 
 
 @dataclass(frozen=True)
-class MonthInput:
-    """一个月末交易日及当月需要下载的指数代码。"""
+class SelectionInput:
+    """一个筛选日、对应指数池和明确的输出文件。"""
 
     selection_date: date
     index_names: Mapping[str, str]
     source_file: Path
-
-    @property
-    def output_file(self) -> Path:
-        return OUTPUT_DIR / self.selection_date.strftime("%Y_%m_%d.csv")
+    output_file: Path
 
 
 def clean_text(value: object) -> str:
@@ -168,7 +165,7 @@ def load_etf_downloader_module() -> ModuleType:
     return module
 
 
-def read_one_month(path: Path) -> MonthInput:
+def read_selection_input(path: Path, output_dir: Path) -> SelectionInput:
     selection_dates: set[date] = set()
     index_names: dict[str, str] = {}
     blank_code_rows: list[int] = []
@@ -206,45 +203,56 @@ def read_one_month(path: Path) -> MonthInput:
     if not index_names:
         raise ValueError(f"{path.name} 没有有效的对标指数代码")
 
-    return MonthInput(
-        selection_date=next(iter(selection_dates)),
+    selection_date = next(iter(selection_dates))
+    return SelectionInput(
+        selection_date=selection_date,
         index_names=dict(sorted(index_names.items())),
         source_file=path,
+        output_file=output_dir / selection_date.strftime("%Y_%m_%d.csv"),
     )
 
 
-def discover_month_inputs() -> list[MonthInput]:
-    if not INITIAL_SELECTION_DIR.exists():
-        raise FileNotFoundError(f"找不到ETF初筛输出目录：{INITIAL_SELECTION_DIR}")
+def discover_selection_inputs(
+    initial_selection_dir: Path,
+    output_dir: Path,
+) -> list[SelectionInput]:
+    if not initial_selection_dir.exists():
+        raise FileNotFoundError(f"找不到ETF初筛输出目录：{initial_selection_dir}")
 
     files = sorted(
         path
-        for path in INITIAL_SELECTION_DIR.glob("*.csv")
+        for path in initial_selection_dir.glob("*.csv")
         if path.is_file()
     )
     if not files:
-        raise FileNotFoundError(f"ETF初筛输出目录中没有CSV：{INITIAL_SELECTION_DIR}")
+        raise FileNotFoundError(
+            f"ETF初筛输出目录中没有CSV：{initial_selection_dir}"
+        )
 
-    months_by_date: dict[date, MonthInput] = {}
+    selections_by_date: dict[date, SelectionInput] = {}
     for path in files:
-        month = read_one_month(path)
-        existing = months_by_date.get(month.selection_date)
+        selection = read_selection_input(path, output_dir)
+        existing = selections_by_date.get(selection.selection_date)
         if existing is not None:
-            if dict(existing.index_names) != dict(month.index_names):
+            if dict(existing.index_names) != dict(selection.index_names):
                 raise ValueError(
                     f"{existing.source_file.name} 与 {path.name} 对应同一交易日"
-                    f" {month.selection_date}，但指数池不同。请先重新运行ETF初筛。"
+                    f" {selection.selection_date}，但指数池不同。"
+                    "请先重新运行ETF初筛。"
                 )
             continue
-        months_by_date[month.selection_date] = month
-    return [months_by_date[current_date] for current_date in sorted(months_by_date)]
+        selections_by_date[selection.selection_date] = selection
+    return [
+        selections_by_date[current_date]
+        for current_date in sorted(selections_by_date)
+    ]
 
 
-def month_output_is_complete(month: MonthInput) -> bool:
+def selection_output_is_complete(selection: SelectionInput) -> bool:
     """只有全部指数具有相同的60个收益日期时才跳过。"""
 
-    path = month.output_file
-    if OVERWRITE_EXISTING_DAYS or not path.exists():
+    path = selection.output_file
+    if OVERWRITE_EXISTING_OUTPUTS or not path.exists():
         return False
 
     rows_by_code: dict[str, list[tuple[date, float, float]]] = defaultdict(list)
@@ -255,13 +263,16 @@ def month_output_is_complete(month: MonthInput) -> bool:
             if list(reader.fieldnames or []) != OUTPUT_COLUMNS:
                 return False
             for row in reader:
-                if clean_text(row.get("月末交易日")) != month.selection_date.isoformat():
+                if (
+                    clean_text(row.get("月末交易日"))
+                    != selection.selection_date.isoformat()
+                ):
                     return False
                 index_code = clean_text(row.get("对标指数代码")).upper()
-                if index_code not in month.index_names:
+                if index_code not in selection.index_names:
                     return False
                 return_date = parse_date(row.get("收益日期"), "收益日期")
-                if return_date > month.selection_date:
+                if return_date > selection.selection_date:
                     return False
                 if return_date in seen_dates[index_code]:
                     return False
@@ -281,7 +292,7 @@ def month_output_is_complete(month: MonthInput) -> bool:
     except (OSError, csv.Error, ValueError):
         return False
 
-    expected_codes = set(month.index_names)
+    expected_codes = set(selection.index_names)
     if set(rows_by_code) != expected_codes or not all(
         len(rows_by_code[code]) == RETURN_TRADING_DAYS
         for code in expected_codes
@@ -490,17 +501,17 @@ def request_akshare_fallback_closes(
 
 
 def common_close_dates(
-    month: MonthInput,
+    selection: SelectionInput,
     closes_by_code: Mapping[str, Mapping[date, float]],
 ) -> list[date]:
-    """返回当月全部指数在月末前共同拥有收盘价的日期。"""
+    """返回全部指数在当前筛选日及以前共同拥有收盘价的日期。"""
 
     common_dates: set[date] | None = None
-    for index_code in month.index_names:
+    for index_code in selection.index_names:
         available_dates = {
             current_date
             for current_date in closes_by_code.get(index_code, {})
-            if current_date <= month.selection_date
+            if current_date <= selection.selection_date
         }
         if common_dates is None:
             common_dates = available_dates
@@ -511,15 +522,15 @@ def common_close_dates(
     return sorted(common_dates or set())
 
 
-def months_without_enough_common_dates(
-    months: Sequence[MonthInput],
+def selections_without_enough_common_dates(
+    selections: Sequence[SelectionInput],
     closes_by_code: Mapping[str, Mapping[date, float]],
-) -> list[MonthInput]:
+) -> list[SelectionInput]:
     required_close_count = RETURN_TRADING_DAYS + 1
     return [
-        month
-        for month in months
-        if len(common_close_dates(month, closes_by_code))
+        selection
+        for selection in selections
+        if len(common_close_dates(selection, closes_by_code))
         < required_close_count
     ]
 
@@ -527,12 +538,12 @@ def months_without_enough_common_dates(
 def download_required_closes(
     downloader: ModuleType,
     access_token: str,
-    pending_months: Sequence[MonthInput],
+    pending_selections: Sequence[SelectionInput],
 ) -> tuple[dict[str, dict[date, float]], dict[str, str]]:
     selection_dates_by_code: dict[str, set[date]] = defaultdict(set)
-    for month in pending_months:
-        for index_code in month.index_names:
-            selection_dates_by_code[index_code].add(month.selection_date)
+    for selection in pending_selections:
+        for index_code in selection.index_names:
+            selection_dates_by_code[index_code].add(selection.selection_date)
 
     all_closes: dict[str, dict[date, float]] = defaultdict(dict)
     requested_windows: dict[str, list[tuple[date, date]]] = defaultdict(list)
@@ -603,32 +614,37 @@ def download_required_closes(
 
     # 全部指数的共同日期不足61个时，逐步向前扩展；每次只请求尚未覆盖的区间。
     for lookback_days in LOOKBACK_CALENDAR_DAY_STEPS[1:]:
-        unresolved_months = months_without_enough_common_dates(
-            pending_months,
+        unresolved_selections = selections_without_enough_common_dates(
+            pending_selections,
             all_closes,
         )
-        if not unresolved_months:
+        if not unresolved_selections:
             break
-        unresolved_months = [
-            month
-            for month in unresolved_months
-            if not any(index_code in errors for index_code in month.index_names)
+        unresolved_selections = [
+            selection
+            for selection in unresolved_selections
+            if not any(
+                index_code in errors
+                for index_code in selection.index_names
+            )
         ]
-        if not unresolved_months:
+        if not unresolved_selections:
             break
 
         extra_windows_by_code: dict[str, list[tuple[date, date]]] = (
             defaultdict(list)
         )
-        for month in unresolved_months:
-            target_start = month.selection_date - timedelta(days=lookback_days)
-            for index_code in month.index_names:
+        for selection in unresolved_selections:
+            target_start = selection.selection_date - timedelta(
+                days=lookback_days
+            )
+            for index_code in selection.index_names:
                 if index_code in errors:
                     continue
                 extra_windows_by_code[index_code].extend(
                     uncovered_windows(
                         target_start,
-                        month.selection_date,
+                        selection.selection_date,
                         requested_windows[index_code],
                     )
                 )
@@ -694,18 +710,18 @@ def download_required_closes(
     return dict(all_closes), errors
 
 
-def monthly_return_rows(
-    month: MonthInput,
+def selection_return_rows(
+    selection: SelectionInput,
     closes_by_code: Mapping[str, Mapping[date, float]],
 ) -> tuple[list[list[str]], list[str]]:
     required_close_count = RETURN_TRADING_DAYS + 1
-    common_dates = common_close_dates(month, closes_by_code)
+    common_dates = common_close_dates(selection, closes_by_code)
     selected_dates = common_dates[-required_close_count:]
     if len(selected_dates) < required_close_count:
-        return [], sorted(month.index_names)
+        return [], sorted(selection.index_names)
 
     rows: list[list[str]] = []
-    for index_code in sorted(month.index_names):
+    for index_code in sorted(selection.index_names):
         index_closes = closes_by_code[index_code]
         previous_close = index_closes[selected_dates[0]]
         for return_date in selected_dates[1:]:
@@ -713,10 +729,10 @@ def monthly_return_rows(
             daily_return = close / previous_close - 1.0
             rows.append(
                 [
-                    month.selection_date.isoformat(),
+                    selection.selection_date.isoformat(),
                     return_date.isoformat(),
                     index_code,
-                    month.index_names[index_code],
+                    selection.index_names[index_code],
                     format(close, ".15g"),
                     format(daily_return, ".15g"),
                 ]
@@ -725,7 +741,10 @@ def monthly_return_rows(
     return rows, []
 
 
-def write_month_output(path: Path, rows: Sequence[Sequence[str]]) -> None:
+def write_selection_output(
+    path: Path,
+    rows: Sequence[Sequence[str]],
+) -> None:
     temp_path = path.with_name(f".{path.name}.tmp")
     try:
         with temp_path.open("w", encoding="utf-8-sig", newline="") as handle:
@@ -738,7 +757,12 @@ def write_month_output(path: Path, rows: Sequence[Sequence[str]]) -> None:
         raise
 
 
-def validate_parameters() -> None:
+def validate_parameters(update_frequency: str) -> None:
+    if update_frequency not in UPDATE_FREQUENCIES:
+        raise ValueError(
+            f"UPDATE_FREQUENCY必须是{UPDATE_FREQUENCIES}之一，"
+            f"当前为{update_frequency!r}"
+        )
     if RETURN_TRADING_DAYS <= 0:
         raise ValueError("RETURN_TRADING_DAYS必须大于0")
     if INITIAL_LOOKBACK_CALENDAR_DAYS <= RETURN_TRADING_DAYS:
@@ -768,29 +792,31 @@ def validate_parameters() -> None:
             raise ValueError(f"AKShare回退配置存在空值：{index_code} -> {config}")
 
 
-def main() -> None:
-    validate_parameters()
-    months = discover_month_inputs()
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def main(update_frequency: str = UPDATE_FREQUENCY) -> None:
+    validate_parameters(update_frequency)
+    initial_selection_dir = etf_pool_initial_dir(update_frequency)
+    output_dir = index_return_dir(update_frequency, RETURN_TRADING_DAYS)
+    selections = discover_selection_inputs(initial_selection_dir, output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    pending_months: list[MonthInput] = []
-    for month in months:
-        if month_output_is_complete(month):
+    pending_selections: list[SelectionInput] = []
+    for selection in selections:
+        if selection_output_is_complete(selection):
             print(
-                f"⏭️ {month.output_file.name} 的60日指数收益率已完整存在，"
+                f"⏭️ {selection.output_file.name} 的60日指数收益率已完整存在，"
                 f"跳过 {HISTORY_ENDPOINT} 请求",
                 flush=True,
             )
         else:
-            pending_months.append(month)
+            pending_selections.append(selection)
 
     print(
-        f"发现 {len(months)} 个日度指数池，其中 "
-        f"{len(pending_months)} 个交易日需要下载或重建",
+        f"发现 {len(selections)} 个 {update_frequency} 指数池，其中 "
+        f"{len(pending_selections)} 个筛选日需要下载或重建",
         flush=True,
     )
-    if not pending_months:
-        print(f"全部日度指数数据已存在：{OUTPUT_DIR}", flush=True)
+    if not pending_selections:
+        print(f"全部指数收益率数据已存在：{output_dir}", flush=True)
         return
 
     downloader = load_etf_downloader_module()
@@ -808,44 +834,49 @@ def main() -> None:
     closes_by_code, download_errors = download_required_closes(
         downloader,
         access_token,
-        pending_months,
+        pending_selections,
     )
 
-    failed_months: dict[str, list[str]] = {}
+    failed_selections: dict[str, list[str]] = {}
     written_count = 0
-    for month in pending_months:
-        rows, insufficient_codes = monthly_return_rows(month, closes_by_code)
+    for selection in pending_selections:
+        rows, insufficient_codes = selection_return_rows(
+            selection,
+            closes_by_code,
+        )
         failed_codes = sorted(
             set(insufficient_codes).union(
-                code for code in month.index_names if code in download_errors
+                code
+                for code in selection.index_names
+                if code in download_errors
             )
         )
         if failed_codes:
-            failed_months[month.output_file.name] = failed_codes
+            failed_selections[selection.output_file.name] = failed_codes
             print(
-                f"❌ {month.output_file.name} 未输出："
+                f"❌ {selection.output_file.name} 未输出："
                 f"未取得全部指数共有的{RETURN_TRADING_DAYS + 1}个收盘日期，"
                 f"代码：{'、'.join(failed_codes)}",
                 flush=True,
             )
             continue
 
-        write_month_output(month.output_file, rows)
+        write_selection_output(selection.output_file, rows)
         written_count += 1
         print(
-            f"✅ 已保存 {month.output_file.name}："
-            f"{len(month.index_names)} 个指数，"
+            f"✅ 已保存 {selection.output_file.name}："
+            f"{len(selection.index_names)} 个指数，"
             f"每个指数 {RETURN_TRADING_DAYS} 个共同区间收益率",
             flush=True,
         )
 
     print(
-        f"完成：本次写入 {written_count} 个日度CSV，输出目录：{OUTPUT_DIR}",
+        f"完成：本次写入 {written_count} 个CSV，输出目录：{output_dir}",
         flush=True,
     )
-    if failed_months:
+    if failed_selections:
         raise RuntimeError(
-            f"仍有 {len(failed_months)} 个日度文件因共同收盘日期不足而未输出；"
+            f"仍有 {len(failed_selections)} 个文件因共同收盘日期不足而未输出；"
             "查看上方日志中的具体指数代码。"
         )
 
