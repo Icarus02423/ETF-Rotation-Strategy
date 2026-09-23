@@ -4,8 +4,11 @@
 !.gitattributes
 !README.md
 !requirements.txt
+!pyproject.toml
 !scripts/
 !scripts/**
+!tests/
+!tests/**
 !outputs/
 !outputs/**
 
