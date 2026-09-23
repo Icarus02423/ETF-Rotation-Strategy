@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-对月底动态指数池中的指数逐日计算两种趋势得分。
+对日度或月度动态指数池中的指数逐日计算两种趋势得分。
 
 计算方法：
 1. 对指数过去N个有效收盘价取自然对数；
@@ -13,20 +13,21 @@
 5. 保留原“收益率×R²”的排名列，另一种得分由回测脚本独立排名。
 
 时间规则：
-- 月末动态指数池使用当月月末已知数据生成；
+- 动态指数池只使用筛选日当日及此前的数据生成；
 - 为避免未来数据，该指数池从下一个ETF交易日开始生效；
-- 在下一个月末指数池生效前，继续使用上一期指数池。
+- 在下一期指数池生效前，继续使用上一期指数池。
 
 输入：
-- outputs/etf_pool/clusters/threshold_<阈值>/reports/*.xlsx
+- outputs/etf_pool/<更新频率>/clusters/threshold_<阈值>/reports/*.xlsx
   只读取第一张“动态指数池”；
-- outputs/etf_trend_strategy/threshold_<阈值>/index_prices/*.csv
+- outputs/etf_trend_strategy/<更新频率>/threshold_<阈值>/index_prices/*.csv
   合并对应聚类阈值下的代表指数连续收盘价；
 - outputs/etf_data/etf_data.csv
   仅用于确定ETF市场交易日。
 
 输出：
-- outputs/etf_trend_strategy/threshold_<阈值>/factors/window_<N>/<年份>.csv
+- outputs/etf_trend_strategy/<更新频率>/threshold_<阈值>/factors/
+  window_<N>/<年份>.csv
 
 本脚本不请求任何数据接口，只使用已有outputs数据。
 """
@@ -35,6 +36,7 @@ from __future__ import annotations
 
 import csv
 import math
+import sys
 from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
@@ -47,12 +49,22 @@ from openpyxl import load_workbook
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from 实验配置 import (
+    CORRELATION_THRESHOLDS,
+    TREND_WINDOWS,
+    UPDATE_FREQUENCIES,
+)
+from 输出路径 import cluster_report_dir, factor_dir, index_price_dir
 
 # ============================= 因子参数 =============================
-# 聚类结果阈值，可改为0.7、0.8或0.9。
-CLUSTER_CORRELATION_THRESHOLD = 0.7
+# 直接运行本脚本时使用的参数；总运行器以后会显式传入实验参数。
+UPDATE_FREQUENCY = "daily"
+CLUSTER_CORRELATION_THRESHOLD = 0.9
 
-# 趋势回归窗口，可改为10、15或20。
+# 趋势回归窗口可使用10、15、20、40或60。
 TREND_WINDOW = 20
 
 START_YEAR = 2021
@@ -63,33 +75,7 @@ END_YEAR = 2026
 MAX_PRICE_STALENESS_CALENDAR_DAYS = 7
 # ====================================================================
 
-ALLOWED_CLUSTER_THRESHOLDS = (0.7, 0.8, 0.9)
-ALLOWED_TREND_WINDOWS = (10, 15, 20)
-
-CLUSTER_POOL_DIR = (
-    PROJECT_ROOT
-    / "outputs"
-    / "etf_pool"
-    / "clusters"
-    / f"threshold_{CLUSTER_CORRELATION_THRESHOLD:g}"
-    / "reports"
-)
-INDEX_RAW_DATA_DIR = (
-    PROJECT_ROOT
-    / "outputs"
-    / "etf_trend_strategy"
-    / f"threshold_{CLUSTER_CORRELATION_THRESHOLD:g}"
-    / "index_prices"
-)
 ETF_DATA_FILE = PROJECT_ROOT / "outputs" / "etf_data" / "etf_data.csv"
-OUTPUT_DIR = (
-    PROJECT_ROOT
-    / "outputs"
-    / "etf_trend_strategy"
-    / f"threshold_{CLUSTER_CORRELATION_THRESHOLD:g}"
-    / "factors"
-    / f"window_{TREND_WINDOW}"
-)
 
 POOL_SHEET_NAME = "动态指数池"
 POOL_REQUIRED_COLUMNS = {
@@ -192,33 +178,47 @@ def parse_positive_float(value: object, field_name: str) -> float:
     return number
 
 
-def validate_parameters() -> None:
+def validate_parameters(
+    update_frequency: str,
+    correlation_threshold: float,
+    trend_window: int,
+) -> None:
+    if update_frequency not in UPDATE_FREQUENCIES:
+        raise ValueError(
+            f"UPDATE_FREQUENCY只能是：{', '.join(UPDATE_FREQUENCIES)}"
+        )
     if not any(
         math.isclose(
-            CLUSTER_CORRELATION_THRESHOLD,
+            correlation_threshold,
             allowed,
             abs_tol=1e-12,
         )
-        for allowed in ALLOWED_CLUSTER_THRESHOLDS
+        for allowed in CORRELATION_THRESHOLDS
     ):
         raise ValueError(
             "CLUSTER_CORRELATION_THRESHOLD只能设为0.7、0.8或0.9"
         )
-    if TREND_WINDOW not in ALLOWED_TREND_WINDOWS:
-        raise ValueError("TREND_WINDOW只能设为20、40或60")
+    if trend_window not in TREND_WINDOWS:
+        raise ValueError(f"TREND_WINDOW只能设为{TREND_WINDOWS}")
     if START_YEAR > END_YEAR:
         raise ValueError("START_YEAR不能晚于END_YEAR")
     if MAX_PRICE_STALENESS_CALENDAR_DAYS < 0:
         raise ValueError("MAX_PRICE_STALENESS_CALENDAR_DAYS不能小于0")
 
 
-def discover_pool_snapshots() -> list[PoolSnapshot]:
-    if not CLUSTER_POOL_DIR.exists():
-        raise FileNotFoundError(f"找不到月底动态指数池：{CLUSTER_POOL_DIR}")
+def discover_pool_snapshots(
+    cluster_pool_directory: Path,
+) -> list[PoolSnapshot]:
+    if not cluster_pool_directory.exists():
+        raise FileNotFoundError(
+            f"找不到动态指数池：{cluster_pool_directory}"
+        )
 
-    files = sorted(CLUSTER_POOL_DIR.glob("*.xlsx"))
+    files = sorted(cluster_pool_directory.glob("*.xlsx"))
     if not files:
-        raise FileNotFoundError(f"动态指数池目录没有XLSX：{CLUSTER_POOL_DIR}")
+        raise FileNotFoundError(
+            f"动态指数池目录没有XLSX：{cluster_pool_directory}"
+        )
 
     snapshots: list[PoolSnapshot] = []
     for path in files:
@@ -287,7 +287,7 @@ def discover_pool_snapshots() -> list[PoolSnapshot]:
 
     snapshot_dates = [snapshot.selection_date for snapshot in snapshots]
     if len(snapshot_dates) != len(set(snapshot_dates)):
-        raise ValueError("动态指数池存在重复月份")
+        raise ValueError("动态指数池存在重复交易日")
     return snapshots
 
 
@@ -313,13 +313,18 @@ def read_etf_trading_calendar() -> list[date]:
 
 def load_index_close_history(
     required_index_codes: set[str],
+    index_raw_data_directory: Path,
 ) -> tuple[dict[str, list[date]], dict[str, list[float]], dict[str, str]]:
-    if not INDEX_RAW_DATA_DIR.exists():
-        raise FileNotFoundError(f"找不到指数历史数据：{INDEX_RAW_DATA_DIR}")
+    if not index_raw_data_directory.exists():
+        raise FileNotFoundError(
+            f"找不到指数历史数据：{index_raw_data_directory}"
+        )
 
-    files = sorted(INDEX_RAW_DATA_DIR.glob("*.csv"))
+    files = sorted(index_raw_data_directory.glob("*.csv"))
     if not files:
-        raise FileNotFoundError(f"指数历史目录没有CSV：{INDEX_RAW_DATA_DIR}")
+        raise FileNotFoundError(
+            f"指数历史目录没有CSV：{index_raw_data_directory}"
+        )
 
     closes_by_code: dict[str, dict[date, float]] = defaultdict(dict)
     index_names: dict[str, str] = {}
@@ -345,7 +350,7 @@ def load_index_close_history(
                     abs_tol=1e-10,
                 ):
                     raise ValueError(
-                        f"{index_code} {price_date}在不同月度文件的"
+                        f"{index_code} {price_date}在不同快照文件的"
                         f"收盘价不一致：{existing} vs {close}"
                     )
                 closes_by_code[index_code][price_date] = close
@@ -369,14 +374,15 @@ def calculate_trend(
     current_date: date,
     price_dates: Sequence[date],
     prices: Sequence[float],
+    trend_window: int,
 ) -> tuple[TrendResult | None, str]:
     end_position = bisect_right(price_dates, current_date)
-    if end_position < TREND_WINDOW:
-        return None, f"截至当日不足{TREND_WINDOW}个有效收盘价"
+    if end_position < trend_window:
+        return None, f"截至当日不足{trend_window}个有效收盘价"
 
-    window_dates = price_dates[end_position - TREND_WINDOW : end_position]
+    window_dates = price_dates[end_position - trend_window : end_position]
     window_prices = np.asarray(
-        prices[end_position - TREND_WINDOW : end_position],
+        prices[end_position - trend_window : end_position],
         dtype=float,
     )
     last_price_date = window_dates[-1]
@@ -385,9 +391,9 @@ def calculate_trend(
         return None, f"最新收盘价滞后{stale_days}个自然日"
 
     log_prices = np.log(window_prices)
-    time_index = np.arange(TREND_WINDOW, dtype=float)
+    time_index = np.arange(trend_window, dtype=float)
     design_matrix = np.column_stack(
-        (np.ones(TREND_WINDOW, dtype=float), time_index)
+        (np.ones(trend_window, dtype=float), time_index)
     )
     intercept, slope = np.linalg.lstsq(
         design_matrix,
@@ -439,7 +445,7 @@ def active_pool_snapshot(
     snapshots: Sequence[PoolSnapshot],
     snapshot_dates: Sequence[date],
 ) -> PoolSnapshot | None:
-    # 严格小于当日：月末结果从下一交易日起生效。
+    # 严格小于当日：当前快照从下一交易日起生效。
     position = bisect_right(snapshot_dates, current_date) - 1
     while position >= 0 and snapshot_dates[position] >= current_date:
         position -= 1
@@ -451,6 +457,7 @@ def build_daily_rows(
     snapshot: PoolSnapshot,
     dates_by_code: Mapping[str, Sequence[date]],
     prices_by_code: Mapping[str, Sequence[float]],
+    trend_window: int,
 ) -> list[dict[str, object]]:
     calculated: list[tuple[PoolMember, TrendResult]] = []
     invalid: list[tuple[PoolMember, str]] = []
@@ -459,6 +466,7 @@ def build_daily_rows(
             current_date,
             dates_by_code.get(member.index_code, ()),
             prices_by_code.get(member.index_code, ()),
+            trend_window,
         )
         if result is None:
             invalid.append((member, status))
@@ -479,7 +487,7 @@ def build_daily_rows(
                 "ETF名称": member.etf_name,
                 "对标指数代码": member.index_code,
                 "对标指数": member.index_name,
-                "趋势窗口": TREND_WINDOW,
+                "趋势窗口": trend_window,
                 "窗口起始日": result.window_start_date.isoformat(),
                 "窗口结束日": result.window_end_date.isoformat(),
                 "窗口起始收盘价": format(result.window_start_close, ".15g"),
@@ -509,15 +517,19 @@ def build_daily_rows(
                 "ETF名称": member.etf_name,
                 "对标指数代码": member.index_code,
                 "对标指数": member.index_name,
-                "趋势窗口": TREND_WINDOW,
+                "趋势窗口": trend_window,
                 "数据状态": status,
             }
         )
     return rows
 
 
-def write_year_output(year: int, rows: Sequence[Mapping[str, object]]) -> Path:
-    output_path = OUTPUT_DIR / f"{year}.csv"
+def write_year_output(
+    output_directory: Path,
+    year: int,
+    rows: Sequence[Mapping[str, object]],
+) -> Path:
+    output_path = output_directory / f"{year}.csv"
     temp_path = output_path.with_name(f".{output_path.name}.tmp")
     try:
         with temp_path.open("w", encoding="utf-8-sig", newline="") as handle:
@@ -535,9 +547,44 @@ def write_year_output(year: int, rows: Sequence[Mapping[str, object]]) -> Path:
     return output_path
 
 
-def main() -> None:
-    validate_parameters()
-    snapshots = discover_pool_snapshots()
+def remove_stale_outputs(
+    output_directory: Path,
+    expected_file_names: set[str],
+) -> int:
+    stale_files = [
+        path
+        for path in output_directory.glob("*.csv")
+        if path.name not in expected_file_names
+    ]
+    for path in stale_files:
+        path.unlink()
+    return len(stale_files)
+
+
+def main(
+    update_frequency: str = UPDATE_FREQUENCY,
+    correlation_threshold: float = CLUSTER_CORRELATION_THRESHOLD,
+    trend_window: int = TREND_WINDOW,
+) -> None:
+    validate_parameters(
+        update_frequency,
+        correlation_threshold,
+        trend_window,
+    )
+    cluster_pool_directory = cluster_report_dir(
+        update_frequency,
+        correlation_threshold,
+    )
+    index_raw_data_directory = index_price_dir(
+        update_frequency,
+        correlation_threshold,
+    )
+    output_directory = factor_dir(
+        update_frequency,
+        correlation_threshold,
+        trend_window,
+    )
+    snapshots = discover_pool_snapshots(cluster_pool_directory)
     snapshot_dates = [snapshot.selection_date for snapshot in snapshots]
     required_index_codes = {
         member.index_code
@@ -546,8 +593,9 @@ def main() -> None:
     }
 
     print(
-        f"聚类阈值 {CLUSTER_CORRELATION_THRESHOLD:g}，"
-        f"趋势窗口 {TREND_WINDOW} 个交易日，"
+        f"更新频率 {update_frequency}，"
+        f"聚类阈值 {correlation_threshold:g}，"
+        f"趋势窗口 {trend_window} 个交易日，"
         f"共 {len(snapshots)} 期动态指数池。",
         flush=True,
     )
@@ -565,15 +613,15 @@ def main() -> None:
             f"截至最新已完成指数池日期{latest_completed_pool_date}没有ETF交易日"
         )
     print(
-        f"计算截止日：{latest_completed_pool_date}"
-        "（不计算尚未完成月末筛选的月份）。",
+        f"计算截止日：{latest_completed_pool_date}。",
         flush=True,
     )
     dates_by_code, prices_by_code, _ = load_index_close_history(
-        required_index_codes
+        required_index_codes,
+        index_raw_data_directory,
     )
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_directory.mkdir(parents=True, exist_ok=True)
     rows_by_year: dict[int, list[dict[str, object]]] = defaultdict(list)
     valid_row_count = 0
     invalid_row_count = 0
@@ -590,6 +638,7 @@ def main() -> None:
             snapshot,
             dates_by_code,
             prices_by_code,
+            trend_window,
         )
         rows_by_year[current_date.year].extend(daily_rows)
         valid_row_count += sum(
@@ -607,18 +656,20 @@ def main() -> None:
     expected_files: set[str] = set()
     for year in range(START_YEAR, END_YEAR + 1):
         year_rows = rows_by_year.get(year, [])
-        output_path = write_year_output(year, year_rows)
+        output_path = write_year_output(
+            output_directory,
+            year,
+            year_rows,
+        )
         expected_files.add(output_path.name)
         print(f"✅ 已保存 {year} 年因子数据：{output_path}", flush=True)
 
-    for old_file in OUTPUT_DIR.glob("*.csv"):
-        if old_file.name not in expected_files:
-            old_file.unlink()
+    remove_stale_outputs(output_directory, expected_files)
 
     print(
         f"完成：有效因子 {valid_row_count} 条，"
         f"数据不足 {invalid_row_count} 条，"
-        f"输出目录：{OUTPUT_DIR}",
+        f"输出目录：{output_directory}",
         flush=True,
     )
 
