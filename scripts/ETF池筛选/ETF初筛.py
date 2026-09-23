@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-按日筛选ETF池，并按对标指数或 benchmark 去重。
+按日或按月筛选ETF池，并按对标指数或 benchmark 去重。
 
 筛选规则：
 1. 截至当日，ETF上市满1年；
@@ -13,8 +13,9 @@
 说明：
 - 只筛选 SELECTED_MAJOR_CATEGORIES 参数指定的ETF大类；
 - 停牌日或成交额空值按0计入20日平均成交额，分母固定为20；
-- 每次运行都会清理输出目录中已有的CSV，再生成本次结果；
-- 每个满足20日成交额回看要求的交易日生成一个CSV；
+- 每次运行只清理当前更新频率输出目录中的CSV，再生成本次结果；
+- daily模式为每个满足20日成交额回看要求的交易日生成一个CSV；
+- monthly模式只为每个自然月最后一个实际交易日生成一个CSV；
 - CSV文件名使用当日交易日期，例如2021年1月29日使用2021_01_29.csv；
 - CSV中的“日期”仍保留当日交易日期；
 - 输出列与 etf_data.csv 完全一致，包含“对标指数代码”；
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import calendar
 import csv
+import sys
 from bisect import bisect_right
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -35,10 +37,18 @@ from typing import Iterable, Iterator, Mapping, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from 实验配置 import UPDATE_FREQUENCIES
+from 输出路径 import etf_pool_initial_dir
+
+
 INPUT_FILE = PROJECT_ROOT / "outputs" / "etf_data" / "etf_data.csv"
-OUTPUT_DIR = PROJECT_ROOT / "outputs" / "etf_pool" / "initial"
 
 # ============================== 筛选参数 ==============================
+# 直接运行本脚本时使用的频率；总运行器以后会显式传入daily或monthly。
+UPDATE_FREQUENCY = "daily"
 START_YEAR = 2021
 END_YEAR = 2026
 # 最后一个已经完整结束的自然月；不要填写仍在进行中的月份。
@@ -65,8 +75,8 @@ REQUIRED_COLUMNS = {
 
 
 @dataclass(frozen=True)
-class DailyPlan:
-    """一个交易日对应的筛选日和20个交易日窗口。"""
+class SelectionPlan:
+    """一个调仓快照对应的筛选日和20个交易日窗口。"""
 
     selection_date: date
     turnover_dates: tuple[date, ...]
@@ -188,7 +198,16 @@ def inspect_input_dates(path: Path) -> tuple[list[str], list[date]]:
     return fieldnames, sorted(available_dates)
 
 
-def build_daily_plans(available_dates: Sequence[date]) -> list[DailyPlan]:
+def build_selection_plans(
+    available_dates: Sequence[date],
+    update_frequency: str,
+) -> list[SelectionPlan]:
+    if update_frequency not in UPDATE_FREQUENCIES:
+        raise ValueError(
+            f"UPDATE_FREQUENCY必须是{UPDATE_FREQUENCIES}之一，"
+            f"当前为{update_frequency!r}"
+        )
+
     latest_available_date = available_dates[-1]
     configured_start_date = date(START_YEAR, 1, 1)
     configured_end_date = date(
@@ -203,7 +222,7 @@ def build_daily_plans(available_dates: Sequence[date]) -> list[DailyPlan]:
             f"无法从{START_YEAR}年开始筛选"
         )
 
-    plans: list[DailyPlan] = []
+    daily_plans: list[SelectionPlan] = []
     for selection_date in available_dates:
         if not configured_start_date <= selection_date <= effective_end_date:
             continue
@@ -215,25 +234,33 @@ def build_daily_plans(available_dates: Sequence[date]) -> list[DailyPlan]:
         )
         if len(turnover_dates) != TURNOVER_LOOKBACK_DAYS:
             continue
-        plans.append(
-            DailyPlan(
+        daily_plans.append(
+            SelectionPlan(
                 selection_date=selection_date,
                 turnover_dates=turnover_dates,
             )
         )
-    if not plans:
+    if not daily_plans:
         raise ValueError(
             f"{configured_start_date}至{effective_end_date}之间没有满足"
             f"{TURNOVER_LOOKBACK_DAYS}日成交额回看要求的交易日"
         )
-    return plans
+
+    if update_frequency == "daily":
+        return daily_plans
+
+    last_plan_by_month: dict[tuple[int, int], SelectionPlan] = {}
+    for plan in daily_plans:
+        month_key = plan.selection_date.year, plan.selection_date.month
+        last_plan_by_month[month_key] = plan
+    return list(last_plan_by_month.values())
 
 
 def iter_daily_data(
     path: Path,
-    plans: Sequence[DailyPlan],
+    plans: Sequence[SelectionPlan],
 ) -> Iterator[
-    tuple[DailyPlan, dict[str, dict[str, str]], Mapping[str, float]]
+    tuple[SelectionPlan, dict[str, dict[str, str]], Mapping[str, float]]
 ]:
     """按日期流式读取CSV，并维护包含当日的20日成交额滚动合计。"""
 
@@ -292,7 +319,7 @@ def iter_daily_data(
 
 
 def base_filter_candidates(
-    plan: DailyPlan,
+    plan: SelectionPlan,
     snapshot: Mapping[str, Mapping[str, str]],
     amount_sums: Mapping[str, float],
 ) -> list[Candidate]:
@@ -375,16 +402,16 @@ def write_daily_file(
     return len(rows)
 
 
-def clear_previous_csv_outputs() -> int:
+def clear_previous_csv_outputs(output_dir: Path) -> int:
     """删除输出目录第一层已有的CSV，避免保留旧结果。"""
 
-    old_files = sorted(path for path in OUTPUT_DIR.glob("*.csv") if path.is_file())
+    old_files = sorted(path for path in output_dir.glob("*.csv") if path.is_file())
     for path in old_files:
         path.unlink()
     return len(old_files)
 
 
-def main() -> None:
+def main(update_frequency: str = UPDATE_FREQUENCY) -> None:
     if START_YEAR > END_YEAR:
         raise ValueError("START_YEAR不能晚于END_YEAR")
     if not 1 <= END_MONTH <= 12:
@@ -399,11 +426,13 @@ def main() -> None:
         f"筛选ETF大类：{'、'.join(SELECTED_MAJOR_CATEGORIES)}",
         flush=True,
     )
+    print(f"更新频率：{update_frequency}", flush=True)
     fieldnames, available_dates = inspect_input_dates(INPUT_FILE)
-    plans = build_daily_plans(available_dates)
+    plans = build_selection_plans(available_dates, update_frequency)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    removed_count = clear_previous_csv_outputs()
+    output_dir = etf_pool_initial_dir(update_frequency)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    removed_count = clear_previous_csv_outputs(output_dir)
     if removed_count:
         print(f"已清理旧的初筛CSV：{removed_count} 个", flush=True)
     written_count = 0
@@ -414,7 +443,7 @@ def main() -> None:
             amount_sums,
         )
         selected = deduplicate_by_benchmark(candidates)
-        output_path = OUTPUT_DIR / plan.file_name
+        output_path = output_dir / plan.file_name
         selected_count = write_daily_file(output_path, fieldnames, selected)
         written_count += 1
         print(
@@ -430,7 +459,7 @@ def main() -> None:
             f"计划生成 {expected_count} 个CSV，实际只生成 {written_count} 个"
         )
     print(
-        f"完成：共生成 {expected_count} 个CSV文件，输出目录：{OUTPUT_DIR}",
+        f"完成：共生成 {expected_count} 个CSV文件，输出目录：{output_dir}",
         flush=True,
     )
 
