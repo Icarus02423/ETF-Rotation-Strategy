@@ -7,6 +7,7 @@
 !pyproject.toml
 !实验配置.py
 !输出路径.py
+!运行全部数据准备.py
 !运行全部回测.py
 !scripts/
 !scripts/**
