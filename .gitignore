@@ -7,12 +7,14 @@
 !pyproject.toml
 !实验配置.py
 !输出路径.py
+!运行全部回测.py
 !scripts/
 !scripts/**
 !tests/
 !tests/**
 !outputs/
 !outputs/**
+outputs/**/.incomplete
 
 **/__pycache__/
 **/*.py[cod]
