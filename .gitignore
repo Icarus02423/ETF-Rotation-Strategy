@@ -9,6 +9,7 @@
 !输出路径.py
 !运行全部数据准备.py
 !运行全部回测.py
+!运行参数调优.py
 !scripts/
 !scripts/**
 !tests/
