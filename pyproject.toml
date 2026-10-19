@@ -1,0 +1,6 @@
+[project]
+name = "etf-rotation-research"
+version = "0.1.0"
+description = "ETF轮动策略研究与回测项目"
+readme = "README.md"
+requires-python = ">=3.9"
